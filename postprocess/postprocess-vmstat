@@ -1,0 +1,284 @@
+#!/usr/bin/perl
+
+#
+# LPCPU (Linux Performance Customer Profiler Utility): ./postprocess/postprocess-vmstat
+#
+# (C) Copyright IBM Corp. 2016
+#
+# This file is subject to the terms and conditions of the Eclipse
+# Public License.  See the file LICENSE.TXT in the main directory of the
+# distribution for more details.
+#
+
+
+# postprocess the vmstat profiler data
+
+use strict;
+#use Data::Dumper;
+use autobench::strings;
+use autobench::jschart;
+use autobench::time;
+
+if (@ARGV < 1) {
+    print STDERR "postprocess-vmstat: No working directory specified\n";
+    exit 1;
+}
+
+if (@ARGV < 2) {
+    print STDERR "postprocess-vmstat: No identifier specified\n";
+    exit 1;
+}
+
+if (@ARGV < 3) {
+    print STDERR "postprocess-vmstat: No invocation id specified\n";
+    exit 1;
+}
+
+my $working_directory = $ARGV[0];
+my $identifier = $ARGV[1];
+my $invocation_id = $ARGV[2];
+
+my $input_file = "vmstat." . $invocation_id . "." . $identifier;
+
+print "Processing File : $input_file\n";
+
+my $vmstat_interval = 5;
+if (!open(INPUT, "<$working_directory/profile-log.$identifier")) {
+    print STDERR "postproces-vmstat: could not open profiler log, using default vmstat_interval=[$vmstat_interval]\n";
+}
+
+while (<INPUT>) {
+    if (($_ =~ /starting vmstat.$invocation_id \[[0-9]+\]/)) {
+	$_ =~ m/.*\[([0-9]+)\].*/;
+	$vmstat_interval = $1;
+	print "Discovered vmstat_interval=[$vmstat_interval]\n";
+	last;
+    }
+}
+
+close INPUT;
+
+if (!open(INPUT,"<$working_directory/$input_file")) {
+    print STDERR "postprocess-vmstat: could not open specified input file\n";
+    exit 1;
+}
+
+my $output_directory = "$working_directory/vmstat-processed.$invocation_id.$identifier";
+mkdir $output_directory;
+mkdir "$output_directory/plot-files";
+
+my @fields;
+my %data;
+my %field_names = ( 'procs_running'    => {'id' =>  0, 'label' => 'Runnable'},
+		    'procs_blocked'    => {'id' =>  1, 'label' => 'Sleeping'},
+		    'memory_swapped'   => {'id' =>  2, 'label' => 'Used Virtual'},
+		    'memory_free'      => {'id' =>  3, 'label' => 'Free'},
+		    'memory_buffer'    => {'id' =>  4, 'label' => 'Buffer Cache'},
+		    'memory_cache'     => {'id' =>  5, 'label' => 'Page Cache'},
+		    'swap_in'          => {'id' =>  6, 'label' => 'In'},
+		    'swap_out'         => {'id' =>  7, 'label' => 'Out'},
+		    'blocks_in'        => {'id' =>  8, 'label' => 'In'},
+		    'blocks_out'       => {'id' =>  9, 'label' => 'Out'},
+		    'interrupts'       => {'id' => 10, 'label' => 'Interrupts'},
+		    'context_switches' => {'id' => 11, 'label' => 'Context Switches'},
+		    'cpu_userspace'    => {'id' => 12, 'label' => '% Userspace Including Nice'},
+		    'cpu_system'       => {'id' => 13, 'label' => '% System'},
+		    'cpu_idle'         => {'id' => 14, 'label' => '% Idle'},
+		    'cpu_iowait'       => {'id' => 15, 'label' => '% IO Wait'},
+		    'cpu_steal'        => {'id' => 16, 'label' => '% Steal'} );
+
+my $key;
+
+my $timestamps = 0;
+my $timestamp_base;
+my $id_adjustment = 0;
+
+while (<INPUT>) {
+    chomp $_;
+
+    # there are two possible outputs that can be parsed:
+
+    # 1) this is the historical vmstat output:
+    #
+    #procs -----------memory---------- ---swap-- -----io---- -system-- -----cpu------
+    # r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+    # 0  0  13536 151964 106740 172184    0    0     0    58  271  102  0  1 99  0  0
+
+    # 2) this is the modified vmstat that includes a timestamp for
+    # each output line -- this differs from the timestamps that some
+    # newer vmstat programs support in order to provide uniformity
+    # between all supported distributions:
+    #
+    # [2015-07-13 14:58:59]: procs -----------memory---------- ---swap-- -----io---- --system-- -----cpu-----
+    # [2015-07-13 14:58:59]:  r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+    # [2015-07-13 14:58:59]:  1  0 280392 344772 296700 1235168    0    3    69    16  324  366  6  2 90  2  0
+
+    if ($_ =~ /procs/ || $_ =~ /cache/) {
+	next;
+    } else {
+	@fields = split(' ', $_);
+
+	if (($fields[0] =~ /^\[/) && ($fields[1] =~ /\]:$/)) {
+	    my $time = $fields[0] . ' ' . $fields[1];
+	    $time =~ s/\[//;
+	    $time =~ s/\]://;
+
+	    $time = time_in_seconds($time);
+
+	    if (!$timestamps) {
+		$timestamps = 1;
+		print "Discovered vmstat has embedded timestamps\n";
+
+		$timestamp_base = $time;
+
+		$id_adjustment = 2;
+	    }
+
+	    if (! exists $data{'time'}) {
+		$data{'time'} = ();
+	    }
+
+	    push @{$data{'time'}}, $time - $timestamp_base;
+	}
+
+	foreach $key (keys %field_names) {
+	    if (! exists $data{$key}) {
+		$data{$key} = ();
+	    }
+
+	    push @{$data{$key}}, $fields[$field_names{$key}{'id'} + $id_adjustment];
+	}
+    }
+}
+
+close INPUT;
+
+#print Dumper \%data;
+
+foreach $key (keys %field_names) {
+    if (!open(OUTPUT_FILE, ">$output_directory/plot-files/$key.plot")) {
+	print STDERR "postprocess-vmstat: Failed to open output file $key.plot.\n";
+	next;
+    } else {
+	print OUTPUT_FILE "#LABEL:" . $field_names{$key}{'label'} . "\n";
+
+	for (my $i=1; $i<@{$data{$key}}; $i++) {
+	    my $timestamp;
+	    if ($timestamps) {
+		$timestamp = $data{'time'}[$i];
+	    } else {
+		$timestamp = $i * $vmstat_interval;
+	    }
+	    print OUTPUT_FILE $timestamp . ' ' . $data{$key}[$i] . "\n";
+	}
+
+	close OUTPUT_FILE;
+    }
+}
+
+if (! $ENV{'FORCE_CHART_PL'}) {
+    my $chart_page = new autobench::jschart("vmstat charts");
+    if ($ENV{'FORCE_JSCHART_REMOTE_LIBRARY'}) {
+	$chart_page->set_library_remote;
+    }
+
+    if (! $ENV{'FORCE_JSCHART_NO_PACKED_PLOTFILES'}) {
+	$chart_page->enable_packed_plotfiles($output_directory);
+    }
+
+    $chart_page->enable_raw_data_file_links('../');
+
+    $chart_page->add_chart('processes', 'line', 'Processes', 'Time (secs.)', 'Processes');
+    $chart_page->add_plots('processes', ('procs_running', 'procs_blocked'));
+    $chart_page->add_raw_data_sources('processes', $input_file);
+
+    $chart_page->add_chart('memory', 'stacked', 'Memory', 'Time (secs.)', 'Memory (KBytes)');
+    $chart_page->add_plots('memory', ('memory_buffer', 'memory_cache', 'memory_free', 'memory_swapped'));
+    $chart_page->add_raw_data_sources('memory', $input_file);
+
+    $chart_page->add_chart('swap', 'line', 'Swap Activity', 'Time (secs.)', 'Throughput (KBytes/sec.)');
+    $chart_page->add_plots('swap', ('swap_in', 'swap_out'));
+    $chart_page->add_raw_data_sources('swap', $input_file);
+
+    $chart_page->add_chart('blockio', 'line', 'Block IO Activity', 'Time (secs.)', 'Throughput (KBytes/sec.)');
+    $chart_page->add_plots('blockio', ('blocks_in', 'blocks_out'));
+    $chart_page->add_raw_data_sources('blockio', $input_file);
+
+    $chart_page->add_chart('interrupts', 'line', 'Interrupt Activity', 'Time (secs.)', 'Interrupts/sec.');
+    $chart_page->add_plots('interrupts', ('interrupts'));
+    $chart_page->add_raw_data_sources('interrupts', $input_file);
+
+    $chart_page->add_chart('ctxswitches', 'line', 'Context Switches', 'Time (secs.)', 'Context Switches/sec.');
+    $chart_page->add_plots('ctxswitches', ('context_switches'));
+    $chart_page->add_raw_data_sources('ctxswitches', $input_file);
+
+    $chart_page->add_chart('cpu', 'stacked', 'CPU Utilization', 'Time (secs.)', 'CPU % Utilization');
+    $chart_page->add_axis_range_bound('cpu', 'y', 'min', 0);
+    $chart_page->add_axis_range_bound('cpu', 'y', 'max', 100);
+    $chart_page->add_plots('cpu', ('cpu_system', 'cpu_userspace', 'cpu_steal', 'cpu_iowait', 'cpu_idle'));
+    $chart_page->add_raw_data_sources('cpu', $input_file);
+
+    if (!open(CHART_HTML, ">$output_directory/chart.html")) {
+	print STDERR "postprocess-vmstat: Could not create chart.html file\n";
+	exit 1;
+    } else {
+	chmod (0644, "$output_directory/chart.html");
+
+	print CHART_HTML $chart_page->dump_page;
+
+	close CHART_HTML;
+
+	if (! $ENV{'FORCE_JSCHART_NO_PACKED_PLOTFILES'}) {
+	    # clean up the non-packed plotfiles
+	    my $deleted_plotfile_count = unlink glob "$output_directory/plot-files/*.plot";
+	    #print "Deleted $deleted_plotfile_count plot files\n";
+	    if (! rmdir "$output_directory/plot-files") {
+		print STDERR "ERROR: Failed to delete $output_directory/plot-files!\n";
+	    }
+	}
+    }
+} else {
+    if (!open(CHART_SCRIPT, ">$output_directory/chart.sh")) {
+	print STDERR "postprocess-vmstat: Could not create chart.sh file\n";
+	exit 1;
+    } else {
+	chmod (0777, "$output_directory/chart.sh");
+
+	print CHART_SCRIPT "#!/bin/bash\n\n";
+	print CHART_SCRIPT 'DIR=`dirname $0`' . "\n\n";
+	print CHART_SCRIPT 'if [ $# != 2 ]; then' . "\n";
+	print CHART_SCRIPT '  echo "You must specify the path to the chart.pl script and the Chart Directory libraries."' . "\n";
+	print CHART_SCRIPT '  exit 1' . "\n";
+	print CHART_SCRIPT 'fi' . "\n\n";
+	print CHART_SCRIPT 'SCRIPT=$1' . "\n";
+	print CHART_SCRIPT 'LIBRARIES=$2' . "\n\n";
+	print CHART_SCRIPT 'export PERL5LIB=$LIBRARIES' . "\n\n";
+	print CHART_SCRIPT 'pushd $DIR > /dev/null' . "\n\n";
+
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . prepend(1) . ' Processes" -x "Time (secs.)" -y "Processes" --legend-position=bottom plot-files/procs_*.plot' . "\n\n";
+	print CHART_SCRIPT '$SCRIPT --table html -s stackedlines --title "' . prepend(2) . ' Memory" -x "Time (secs.)" -y "Memory (KBytes)" --legend-position=bottom plot-files/memory_*.plot' . "\n\n";
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . prepend(3) . ' Swap" -x "Time (secs.)" -y "KBytes/Second" --legend-position=bottom plot-files/swap_*.plot' . "\n\n";
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . prepend(4) . ' Block IO" -x "Time (secs.)" -y "KBytes/Second" --legend-position=bottom plot-files/blocks_*.plot' . "\n\n";
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . prepend(5) . ' Interrupts" -x "Time (secs.)" -y "Interrupts/Second" --legend-position=bottom plot-files/interrupts.plot' . "\n\n";
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . prepend(6) . ' Context Switches" -x "Time (secs.)" -y "Context Switches/Second" --legend-position=bottom plot-files/context_switches.plot' . "\n\n";
+	print CHART_SCRIPT '$SCRIPT --table html -s stackedlines --title "' . prepend(7) . ' CPU" -x "Time (secs.)" -y "CPU % Utilization" --legend-position=bottom --y-range 0:100 plot-files/cpu_*.plot' . "\n\n";
+
+	print CHART_SCRIPT 'echo -e "<html>\n<head>\n<title>vmstat Charts</title>\n</head>\n<body>\n" > chart.html' . "\n";
+
+	print CHART_SCRIPT 'for i in `ls -1 *.png`; do' . "\n";
+	print CHART_SCRIPT '  echo -e "<table>\n<tr valign=\'top\'>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  echo -e "<td><img src=\'$i\'></td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  html_file=`echo $i | sed -e "s/png/html/"`' . "\n";
+	print CHART_SCRIPT '  if [ -e $html_file ]; then' . "\n";
+	print CHART_SCRIPT '    echo -e "<td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '    cat $html_file >> chart.html' . "\n";
+	print CHART_SCRIPT '    echo -e "</td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  fi' . "\n";
+	print CHART_SCRIPT '  echo -e "</tr>\n</table>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT 'done' . "\n\n";
+
+	print CHART_SCRIPT 'echo -e "</body>\n</html>\n" >> chart.html' . "\n";
+
+	close CHART_SCRIPT;
+    }
+}

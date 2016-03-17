@@ -1,0 +1,82 @@
+
+#
+# LPCPU (Linux Performance Customer Profiler Utility): ./README.rtst
+#
+# (C) Copyright IBM Corp. 2016
+#
+# This file is subject to the terms and conditions of the Eclipse
+# Public License.  See the file LICENSE.TXT in the main directory of the
+# distribution for more details.
+#
+
+RTST - Real Time Server Telemetry
+
+1. Overview
+2. Dependencies
+3. Running RTST
+4. Viewing the data
+
+1. Overview
+===========
+
+RTST is a framework for viewing server telemetry in real time via a
+remote web browser.  By using standard Internet technologies (HTTP,
+HTML, Javascript, etc.) RTST aims to be easily portable across
+environments.
+
+RTST currently supports 4 charts: system wide CPU, system wide disk
+IO, selectable network interface monitoring, and system wide memory
+usage.
+
+2. Dependencies
+===============
+
+RTST requires that Python and sar (sysstat package) be installed.
+
+3. Running RTST
+===============
+
+RTST aims to be flexibly configured via the command line.  All
+configuration options are setup as required command line options.
+Here is the help output for RTST:
+
+./rtst.py --help
+
+Required options for ./rtst.py are:
+
+        --server-interval=<int>         How often should the server collect samples
+        --client-interval=<int>         How often should the client request new data from the server
+        --server-history=<int>          How many samples should the server buffer for sample history
+        --client-history=<int>          How many samples should the client buffer for sample history by default (client can dynamically change this value)
+        --server-name=<string>          What is the accessible hostname the client should use to access the server
+        --server-port=<int>             What TCP port should the server listen on (must be open through any/all firewalls)
+        --selected-interfaces=<string>  Comma separated list of interfaces to monitor
+
+        Available interfaces for monitoring are: lo eth4 eth0 eth1 eth2 eth3 usb0
+
+As discussed in the LPCPU README file, the charting technology used by
+LPCPU/RTST must be cognizant of some browser security issues in order
+to function properly.  The --server-name=<string> parameter is what
+allows this to be handled.  The DNS hostname that the client will use
+to connect to the server must be supplied as the value to this
+argument otherwise the browser may refuse to load the chart data.
+
+Here is an example invocation:
+
+./rtst.py --server-interval=1 --client-interval=1 --server-history=120 --client-history=900 --server-name=my.server.hostname.com --server-port=1338 --selected-interfaces=eth0,eth1,eth4
+Main Thread: Started...
+Monitoring eth0,eth1,eth4
+Monitoring Interval: 1
+Client Update Interval: 1
+History Length: 120
+Client History Length: 900
+Server Name: my.server.hostname.com
+Server Port: 1338
+To view the statistics, load http://my.server.hostname.com:1338 in your web browser
+To exit the server, use CTRL-C
+
+4. Viewing the data
+===================
+
+To view the data, simply open the URL that the script provides in your
+web browser.

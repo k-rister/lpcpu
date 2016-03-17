@@ -1,0 +1,93 @@
+
+<!--
+  LPCPU (Linux Performance Customer Profiler Utility): ./tools/rtst/index.html
+
+  (C) Copyright IBM Corp. 2016
+
+  This file is subject to the terms and conditions of the Eclipse
+  Public License.  See the file LICENSE.TXT in the main directory of the
+  distribution for more details.
+-->
+
+<html>
+<head>
+<title>Realtime %SERVER_NAME% Server Telemetry</title>
+<link rel="stylesheet" href="jschart.pm/jschart.css"/>
+</head>
+<body>
+<script src="http://d3js.org/d3.v3.min.js" charset="utf-8"></script>
+<script src="http://d3js.org/queue.v1.min.js" charset="utf-8"></script>
+<script src="jschart.pm/jschart.js" charset="utf-8"></script>
+
+<br/>
+<table>
+  <tr valign='top'>
+    <td id='jschart_cpustats_chart'>
+      <script>
+        create_graph(1, "jschart_cpustats", "1. CPU Stats", "Time (secs.)", "CPU Utilization", { y_min: 0, y_max: 100, json_plotfile: "http://%SERVER_NAME%:%SERVER_PORT%", json_args: "type=cpu", update_interval: %CLIENT_UPDATE_INTERVAL%, history_length: %CLIENT_HISTORY_LENGTH% });
+      </script>
+    </td>
+    <td>
+      <table class='chart' id='jschart_cpustats_table'>
+        <tr class='header'><th colspan='4'>1. CPU Stats</th></tr>
+        <tr class='header'><th align='left'>Data Sets</th><th align='right'>Data Set Average</th><th align='right'>Data Set Median</th><th>Samples</th></tr>
+      </table>
+    </td>
+   </tr>
+</table>
+
+<br/>
+<table>
+  <tr valign='top'>
+    <td id='jschart_iobwstats_chart'>
+      <script>
+        create_graph(0, "jschart_iobwstats", "2. IO Bandwidth Stats", "Time (secs.)", "IO (KB/s)", { json_plotfile: "http://%SERVER_NAME%:%SERVER_PORT%", json_args: "type=io_bw", update_interval: %CLIENT_UPDATE_INTERVAL%, history_length: %CLIENT_HISTORY_LENGTH% });
+      </script>
+    </td>
+    <td>
+      <table class='chart' id='jschart_iobwstats_table'>
+        <tr class='header'><th colspan='4'>2. IO Bandwidth Stats</th></tr>
+        <tr class='header'><th align='left'>Data Sets</th><th align='right'>Data Set Average</th><th align='right'>Data Set Median</th><th>Samples</th></tr>
+      </table>
+    </td>
+   </tr>
+</table>
+
+<br/>
+<table>
+  <tr valign='top'>
+    <td id='jschart_netstats_chart'>
+      <script>
+        create_graph(0, "jschart_netstats", "3. Network Stats", "Time (secs.)", "Network IO (KB/s)", { json_plotfile: "http://%SERVER_NAME%:%SERVER_PORT%", json_args: "type=net", update_interval: %CLIENT_UPDATE_INTERVAL%, history_length: %CLIENT_HISTORY_LENGTH% });
+      </script>
+    </td>
+    <td>
+      <table class='chart' id='jschart_netstats_table'>
+        <tr class='header'><th colspan='4'>3. Network Stats</th></tr>
+        <tr class='header'><th align='left'>Data Sets</th><th align='right'>Data Set Average</th><th align='right'>Data Set Median</th><th>Samples</th></tr>
+      </table>
+    </td>
+   </tr>
+</table>
+
+<br/>
+<table>
+  <tr valign='top'>
+    <td id='jschart_meminfo_chart'>
+      <script>
+        create_graph(1, "jschart_meminfo", "4. Memory Stats", "Time (secs.)", "Memory (MB)", { json_plotfile: "http://%SERVER_NAME%:%SERVER_PORT%", json_args: "type=mem", update_interval: %CLIENT_UPDATE_INTERVAL%, history_length: %CLIENT_HISTORY_LENGTH% });
+      </script>
+    </td>
+    <td>
+      <table class='chart' id='jschart_meminfo_table'>
+        <tr class='header'><th colspan='4'>4. Memory Stats</th></tr>
+        <tr class='header'><th align='left'>Data Sets</th><th align='right'>Data Set Average</th><th align='right'>Data Set Median</th><th>Samples</th></tr>
+      </table>
+    </td>
+   </tr>
+</table>
+
+<script>finish_page()</script>
+
+</body>
+</html>

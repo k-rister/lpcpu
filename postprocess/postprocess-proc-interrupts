@@ -1,0 +1,513 @@
+#!/usr/bin/perl
+
+#
+# LPCPU (Linux Performance Customer Profiler Utility): ./postprocess/postprocess-proc-interrupts
+#
+# (C) Copyright IBM Corp. 2016
+#
+# This file is subject to the terms and conditions of the Eclipse
+# Public License.  See the file LICENSE.TXT in the main directory of the
+# distribution for more details.
+#
+
+
+# postprocess the proc-interrupts profiler data.
+
+# set the environment variable PROC_INTERRUPTS_NO_NUMA to any value to
+# prevent NUMA aware processing this is useful when PROC INTERRUPTS
+# data is being processed offline on a different box than where the
+# data was collected, the NUMA aware processing requires that
+# postprocess-proc-interrupts be run on the same machine as where the
+# data was collected or that a topology archive be supplied
+
+use strict;
+#use Data::Dumper;
+use autobench::strings;
+use autobench::time;
+use autobench::topology;
+use autobench::jschart;
+
+if (@ARGV < 1) {
+	print STDERR "postprocess-proc-interrupts: No working directory specified.\n";
+	exit 1;
+}
+
+if (@ARGV < 2) {
+	print STDERR "postprocess-proc-interrupts: No run number specified.\n";
+	exit 1;
+}
+
+my $working_directory = $ARGV[0];
+my $identifier = $ARGV[1];
+my $invocation_id;
+my $input_file;
+my $topology_archive;
+
+if (@ARGV > 2) {
+    if (@ARGV > 3) {
+	$topology_archive = $ARGV[3];
+    }
+
+    $invocation_id = $ARGV[2];
+
+    $input_file = "proc-interrupts." . $invocation_id . "." . $identifier;
+} else {
+    $input_file = "proc-interrupts." . $identifier;
+}
+
+print "Processing File : $input_file\n";
+
+my $interval = 5;
+
+if (open(INPUT,"<$working_directory/profile-log.$identifier")) {
+	while (<INPUT>) {
+		if (($_ =~ /starting proc-interrupts \[[0-9]+\]/)) {
+			$_ =~ m/.*\[([0-9]+)\].*/;
+			$interval = $1;
+			print "Discovered proc-interrupts interval=[$interval]\n";
+		}
+	}
+} else {
+	print STDERR "postprocess-proc-interrupts: could not open $working_directory/profile-log.$identifier  Using default interval of $interval.\n";
+}
+
+close INPUT;
+
+if (!open(INPUT,"<$working_directory/$input_file")) {
+	print STDERR "postprocess-proc-interrupts: could not open specified input file.\n";
+	exit 1;
+}
+
+my $output_directory;
+
+if (@ARGV > 2) {
+    $output_directory = "$working_directory/proc-interrupts-processed.$invocation_id.$identifier";
+} else {
+    $output_directory = "$working_directory/proc-interrupts-processed.$identifier";
+}
+
+`rm -rf $output_directory`;
+mkdir $output_directory;
+mkdir "$output_directory/plot-files";
+
+my $elapsed_time = 0;
+my @intervals;
+my @cpus;
+my %irq_data;
+my %cpu_data;
+my $prev_time = 0;
+my $line;
+my @fields;
+my $i;
+
+while (<INPUT>) {
+	$line = $_;
+	chomp $line;
+
+	if ($line =~ /[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) {
+		my $curr_time;
+		if ($line =~ / \/ /) {
+		    $line =~ m/.*\/ ([0-9]+)/;
+		    $curr_time = $1;
+		} else {
+		    $curr_time = time_in_seconds($line);
+		}
+		if ($prev_time) {
+			$interval = $curr_time - $prev_time;
+		}
+		$elapsed_time += $interval;
+		push @intervals, $elapsed_time;
+		$prev_time = $curr_time;
+
+		@cpus = split " ", <INPUT>;
+
+		my $index = 0;
+		while (1) {
+			$line = <INPUT>;
+			chomp $line;
+			last if (! $line);
+
+			@fields = ();
+			@fields	= split " ", $line, @cpus + 2;
+
+			my $irq = shift @fields;
+
+			# Get rid of the colon since we use the irq name as part
+			# of the plot file name.
+			$irq =~ s/://;
+
+			# Prepend an index number so that we can
+			# sort the IRQ plot files in the order seen
+			# in the output.
+			$irq = prepend($index, 2) . "|" . $irq;
+
+			# if the number of elements in @fields exceeds the elements in
+			# @cpus, there is a description of the IRQ in the last field
+			if (@fields > @cpus) {
+			    # collapse multiple space fields to a single space
+			    $fields[@fields - 1] =~ s/\s+/ /g;
+			    # append the rest of the IRQ descriptor
+			    $irq .= " " . $fields[@fields - 1];
+			}
+
+			for ($i = 0; $i < @cpus; $i++) {
+				# Prepend an index number so that we can
+				# sort the CPU plot files in the order seen
+				# in the output.
+				my $cpu = prepend($i, 2) . "|" . $cpus[$i];
+
+				push @{$irq_data{$irq}{$cpu}}, $fields[$i] / $interval;
+				push @{$cpu_data{$cpu}{$irq}}, $fields[$i] / $interval;
+			}
+			$index++;
+		}
+	}
+
+}
+
+close INPUT;
+
+#print Dumper \@intervals;
+#print Dumper \@cpus;
+#print Dumper \%irq_data;
+#print Dumper \%cpu_data;
+
+# initialize the topology information
+my $topology;
+if ((@ARGV > 3) && ! exists $ENV{'PROC_INTERRUPTS_NO_NUMA'}) {
+    print "postprocess-proc-interrupts: Loading topology archive from $topology_archive\n";
+    $topology = new autobench::topology(undef, $topology_archive);
+} else {
+    $topology = new autobench::topology;
+}
+my %numa;
+
+if (! exists $ENV{'PROC_INTERRUPTS_NO_NUMA'} && $topology->check_numa_support) {
+    my @numa_nodes = $topology->get_numa_node_list;
+    my $node;
+
+    foreach $node (@numa_nodes) {
+	$numa{$node} = ();
+	my @array = $topology->get_numa_node_online_processors($node);
+	push @{$numa{$node}}, @array;
+    }
+
+    #print Dumper \%numa;
+} else {
+    if (exists $ENV{'PROC_INTERRUPTS_NO_NUMA'}) {
+	if (@ARGV > 3) {
+	    print "You specified a topology archive to load ($topology_archive) but you also set the PROC_INTERRUPTS_NO_NUMA environment variable.  This does not make much sense.\n";
+	} else {
+	    print "NUMA aware processing explicity disabled\n";
+	}
+    }
+
+    if (! $topology->check_numa_support) {
+	print "NUMA toplogy information not available\n";
+    }
+}
+
+my $irq;
+my $cpu;
+my $i;
+
+foreach $irq (keys %irq_data) {
+	my $irq_filename = $irq;
+	$irq_filename =~ s/\s/_/g;
+	$irq_filename =~ s/\|/_/g;
+	$irq_filename =~ s/\//_/g;
+	$irq_filename =~ s/,/_/g;
+	$irq_filename =~ s/:/_/g;
+
+	foreach $cpu (keys %{$irq_data{$irq}}) {
+		my $cpu_filename = $cpu;
+		$cpu_filename =~ s/\s/_/g;
+		$cpu_filename =~ s/\|/_/g;
+
+		if (!open(OUTPUT_FILE, ">$output_directory/plot-files/interrupts-" . $irq_filename . "-" . $cpu_filename . ".plot")) {
+			print STDERR "postprocess-proc-interrupts: Failed to open output file $irq for $cpu.\n";
+			next;
+		} else {
+			$cpu =~ m/.*\|(.*)$/;
+			print OUTPUT_FILE "#LABEL:" . $1 . "\n";
+
+			for ($i=0; $i<@{$irq_data{$irq}{$cpu}}; $i++) {
+				print OUTPUT_FILE $intervals[$i] . ' ' . $irq_data{$irq}{$cpu}[$i] . "\n";
+			}
+
+			close OUTPUT_FILE;
+		}
+	}
+}
+
+foreach $cpu (keys %cpu_data) {
+	my $cpu_filename = $cpu;
+	$cpu_filename =~ s/\s/_/g;
+	$cpu_filename =~ s/\|/_/g;
+
+	foreach $irq (keys %{$cpu_data{$cpu}}) {
+		my $irq_filename = $irq;
+		$irq_filename =~ s/\s/_/g;
+		$irq_filename =~ s/\|/_/g;
+		$irq_filename =~ s/\//_/g;
+		$irq_filename =~ s/,/_/g;
+		$irq_filename =~ s/:/_/g;
+
+		if (!open(OUTPUT_FILE, ">$output_directory/plot-files/interrupts-" . $cpu_filename . "-" . $irq_filename . ".plot")) {
+			print STDERR "postprocess-proc-interrupts: Failed to open output file $cpu for $irq.\n";
+			next;
+		} else {
+			$irq =~ m/.*\|(.*)$/;
+			print OUTPUT_FILE "#LABEL:IRQ " . $1 . "\n";
+
+			for ($i=0; $i<@{$cpu_data{$cpu}{$irq}}; $i++) {
+				print OUTPUT_FILE $intervals[$i] . ' ' . $cpu_data{$cpu}{$irq}[$i] . "\n";
+			}
+
+			close OUTPUT_FILE;
+		}
+	}
+
+	$cpu_filename =~ s/.*(CPU.*)$/\1/;
+
+	if (!open(OUTPUT_FILE, ">$output_directory/plot-files/" . $cpu_filename . ".plot")) {
+	    print STDERR "postprocess-proc-interrupts: Failed to open output file " . $cpu_filename . ".plot\n";
+	    next;
+	} else {
+	    print OUTPUT_FILE "#LABEL:" . $cpu_filename . "\n";
+
+	    for ($i=0; $i<@intervals; $i++) {
+		my $interrupts = 0;
+
+		foreach $irq (keys (%{$cpu_data{$cpu}})) {
+		    $interrupts += $cpu_data{$cpu}{$irq}[$i];
+		}
+
+		print OUTPUT_FILE $intervals[$i] . ' ' . $interrupts . "\n";
+	    }
+
+	    close OUTPUT_FILE;
+	}
+}
+
+if (! $ENV{'FORCE_CHART_PL'}) {
+    my $chart_page = new autobench::jschart("proc-interrupts Charts");
+    if ($ENV{'FORCE_JSCHART_REMOTE_LIBRARY'}) {
+	$chart_page->set_library_remote;
+    }
+
+    if (! $ENV{'FORCE_JSCHART_NO_PACKED_PLOTFILES'}) {
+	$chart_page->enable_packed_plotfiles($output_directory);
+    }
+
+    $chart_page->enable_raw_data_file_links('../');
+
+    $chart_page->add_link('irq_link', '#irq_section', 'Interrupt Distribution');
+    $chart_page->add_link('cpu_link', '#cpu_section', 'Per CPU Interrupts');
+
+    if (! exists $ENV{'PROC_INTERRUPTS_NO_NUMA'} && $topology->check_numa_support) {
+	$chart_page->add_link('numa_link', '#numa_section', 'Per NUMA Node Interrupts');
+    }
+
+    $chart_page->add_section('irq_section', 'Interrupt Distribution');
+
+    for $irq (sort { $a <=> $b } (keys %irq_data)) {
+	$irq =~ m/.*\|(.*)$/;
+	my $print_irq = $1;
+	$irq =~ s/\s/_/g;
+	$irq =~ s/\|/_/g;
+	$irq =~ s/\//_/g;
+	$irq =~ s/,/_/g;
+	$irq =~ s/:/_/g;
+	$irq =~ s/\(/\\\(/g;
+	$irq =~ s/\)/\\\)/g;
+	$irq =~ s/\[/\\\[/g;
+	$irq =~ s/\]/\\\]/g;
+
+	$chart_page->add_chart('irq_' . $irq, 'stacked', 'Interrupts on IRQ ' . $print_irq, 'Time (secs.)', 'Interrupts / sec.');
+	foreach my $cpu (sort { $a <=> $b } (keys %cpu_data)) {
+	    $cpu =~ s/\s/_/g;
+	    $cpu =~ s/\|/_/g;
+
+	    $chart_page->add_plots('irq_' . $irq, 'interrupts-' . $irq . '-' . $cpu);
+	}
+
+	$chart_page->add_raw_data_sources('irq_' . $irq, $input_file);
+    }
+
+    $chart_page->add_section('cpu_section', 'Per CPU Interrupts');
+
+    for $cpu (sort { $a <=> $b } (keys %cpu_data)) {
+	$cpu =~ m/.*\|(.*)$/;
+	my $print_cpu = $1;
+	$cpu =~ s/\s/_/g;
+	$cpu =~ s/\|/_/g;
+
+	$chart_page->add_chart('cpu_' . $cpu, 'stacked', 'Interrupts on ' . $print_cpu, 'Time (secs.)', 'Interrupts / sec.');
+	foreach my $irq (sort { $a <=> $b } (keys %irq_data)) {
+	    $irq =~ s/\s/_/g;
+	    $irq =~ s/\|/_/g;
+	    $irq =~ s/\//_/g;
+	    $irq =~ s/,/_/g;
+	    $irq =~ s/:/_/g;
+	    $irq =~ s/\(/\\\(/g;
+	    $irq =~ s/\)/\\\)/g;
+	    $irq =~ s/\[/\\\[/g;
+	    $irq =~ s/\]/\\\]/g;
+
+	    $chart_page->add_plots('cpu_' . $cpu, 'interrupts-' . $cpu . '-' . $irq);
+	}
+
+	$chart_page->add_raw_data_sources('cpu_' . $cpu, $input_file);
+    }
+
+    if (! exists $ENV{'PROC_INTERRUPTS_NO_NUMA'} && $topology->check_numa_support) {
+	$chart_page->add_section('numa_section', 'Per NUMA Node Interrupts');
+	print Dumper \%numa;
+	foreach my $node (sort {$a <=> $b} (keys %numa)) {
+	    $chart_page->add_chart('numa_' . $node, 'stacked', 'Interrupts on Node ' . $node, 'Time (secs.)', 'Interrupts / sec');
+
+	    for (my $x=0; $x<@{$numa{$node}}; $x++) {
+		$chart_page->add_plots('numa_' . $node, 'CPU' . $numa{$node}[$x]);
+	    }
+	}
+    }
+
+    if (!open(CHART_HTML, ">$output_directory/chart.html")) {
+	print STDERR "postprocess-proc-interrupts: Could not create chart.html file\n";
+	exit 1;
+    } else {
+	chmod (0644, "$output_directory/chart.html");
+
+	print CHART_HTML $chart_page->dump_page;
+
+	close CHART_HTML;
+
+	if (! $ENV{'FORCE_JSCHART_NO_PACKED_PLOTFILES'}) {
+	    # clean up the non-packed plotfiles
+	    my $deleted_plotfile_count = unlink glob "$output_directory/plot-files/*.plot";
+	    #print "Deleted $deleted_plotfile_count plot files\n";
+	    if (! rmdir "$output_directory/plot-files") {
+		print STDERR "ERROR: Failed to delete $output_directory/plot-files!\n";
+	    }
+	}
+    }
+} else {
+    if (!open(CHART_SCRIPT, ">$output_directory/chart.sh")) {
+	print STDERR "postprocess-proc-interrupts: Could not create chart.sh file.\n";
+	exit 1;
+    } else {
+	chmod (0777, "$output_directory/chart.sh");
+
+	print CHART_SCRIPT "#!/bin/bash\n\n";
+	print CHART_SCRIPT 'DIR=`dirname $0`' . "\n\n";
+	print CHART_SCRIPT 'if [ $# != 2 ]; then' . "\n";
+	print CHART_SCRIPT '  echo "You must specify the path to the chart.pl script and the Chart Directory libraries."' . "\n";
+	print CHART_SCRIPT '  exit 1' . "\n";
+	print CHART_SCRIPT 'fi' . "\n\n";
+	print CHART_SCRIPT 'SCRIPT=$1' . "\n";
+	print CHART_SCRIPT 'LIBRARIES=$2' . "\n\n";
+	print CHART_SCRIPT 'export PERL5LIB=$LIBRARIES' . "\n\n";
+	print CHART_SCRIPT 'pushd $DIR > /dev/null' . "\n\n";
+
+	my $counter = 0;
+	for $irq (sort { $a <=> $b } (keys %irq_data)) {
+		$irq =~ m/.*\|(.*)$/;
+		my $print_irq = $1;
+		$irq =~ s/\s/_/g;
+		$irq =~ s/\|/_/g;
+		$irq =~ s/\//_/g;
+		$irq =~ s/,/_/g;
+		$irq =~ s/:/_/g;
+		$irq =~ s/\(/\\\(/g;
+		$irq =~ s/\)/\\\)/g;
+		$irq =~ s/\[/\\\[/g;
+		$irq =~ s/\]/\\\]/g;
+		print CHART_SCRIPT '$SCRIPT --table html -s stackedlines --title "INT ' . auto_prepend($counter++, %irq_data + %cpu_data + %numa) . ' Interrupts on IRQ ' . $print_irq . '" -x "Time (secs.)" -y "Interrupts / sec" plot-files/interrupts-' . $irq . '-*.plot' . "\n";
+	}
+
+	for $cpu (sort { $a <=> $b } (keys %cpu_data)) {
+		$cpu =~ m/.*\|(.*)$/;
+		my $print_cpu = $1;
+		$cpu =~ s/\s/_/g;
+		$cpu =~ s/\|/_/g;
+		print CHART_SCRIPT '$SCRIPT --table html -s stackedlines --title "CPU ' . auto_prepend($counter++, %irq_data + %cpu_data + %numa) . ' Interrupts on ' . $print_cpu . '" -x "Time (secs.)" -y "Interrupts / sec" plot-files/interrupts-' . $cpu . '-*.plot' . "\n";
+	}
+
+	if (! exists $ENV{'PROC_INTERRUPTS_NO_NUMA'} && $topology->check_numa_support) {
+	    foreach my $node (sort {$a <=> $b} (keys %numa)) {
+		print CHART_SCRIPT '$SCRIPT --table html -s stackedlines --title "NUMA ' . auto_prepend($counter++, %irq_data + %cpu_data + %numa) . ' Interrupts on Node ' . $node . '" -x "Time (secs.)" -y "Interrupts / sec"';
+
+		for (my $x=0; $x<@{$numa{$node}}; $x++) {
+		    print CHART_SCRIPT ' plot-files/CPU' . $numa{$node}[$x] . '.plot';
+		}
+
+		print CHART_SCRIPT "\n";
+	    }
+	}
+
+	print CHART_SCRIPT 'echo -e "<html>\n<head>\n<title>proc-interrupts Charts</title>\n</head>\n<body>\n" > chart.html' . "\n";
+
+	print CHART_SCRIPT 'echo -e "<a href=\'#interrupts\'>Interrupt Distribution</a>" >> chart.html' . "\n";
+	print CHART_SCRIPT 'echo -e "<a href=\'#cpus\'>Per CPU Interrupts</a>" >> chart.html' . "\n";
+	if (! exists $ENV{'PROC_INTERRUPTS_NO_NUMA'} && $topology->check_numa_support) {
+	    print CHART_SCRIPT 'echo -e "<a href=\'#numa\'>Per NUMA Node Interrupts</a>" >> chart.html' . "\n";
+	}
+
+	print CHART_SCRIPT 'echo -e "<a name=\'interrupts\'><h1>Interrupt Distribution</h1></a>" >> chart.html' . "\n";
+	print CHART_SCRIPT 'for i in `ls -1 INT*.png`; do' . "\n";
+	print CHART_SCRIPT '  echo -e "<table>\n<tr valign=\'top\'>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  echo -e "<td><img src=\'$i\'></td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  html_file=`echo $i | sed -e "s/png/html/"`' . "\n";
+	print CHART_SCRIPT '  if [ -e $html_file ]; then' . "\n";
+	print CHART_SCRIPT '    echo -e "<td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '    cat $html_file >> chart.html' . "\n";
+	print CHART_SCRIPT '    echo -e "</td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  fi' . "\n";
+	print CHART_SCRIPT '  echo -e "</tr>\n</table>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT 'done' . "\n\n";
+
+	print CHART_SCRIPT 'echo -e "<a name=\'cpus\'><h1>Per CPU Interrupts</h1></a>" >> chart.html' . "\n";
+	print CHART_SCRIPT 'for i in `ls -1 CPU*.png`; do' . "\n";
+	print CHART_SCRIPT '  echo -e "<table>\n<tr valign=\'top\'>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  echo -e "<td><img src=\'$i\'></td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  html_file=`echo $i | sed -e "s/png/html/"`' . "\n";
+	print CHART_SCRIPT '  if [ -e $html_file ]; then' . "\n";
+	print CHART_SCRIPT '    echo -e "<td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '    cat $html_file >> chart.html' . "\n";
+	print CHART_SCRIPT '    echo -e "</td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  fi' . "\n";
+	print CHART_SCRIPT '  echo -e "</tr>\n</table>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT 'done' . "\n\n";
+
+	if (! exists $ENV{'PROC_INTERRUPTS_NO_NUMA'} && $topology->check_numa_support) {
+	    print CHART_SCRIPT 'echo -e "<a name=\'numa\'><h1>Per NUMA Node Interrupts</h1></a>" >> chart.html' . "\n";
+
+	    print CHART_SCRIPT 'echo -e "<table border=\'1\'>\n<tr><th>NUMA Node</th><th>Node CPUs</th></tr>\n" >> chart.html' . "\n";
+	    foreach my $node (sort { $a <=> $b } (keys %numa)) {
+		print CHART_SCRIPT 'echo -e "<tr><td>' . $node . '</td><td>';
+		foreach my $cpu (sort { $a <=> $b } (@{$numa{$node}})) {
+		    print CHART_SCRIPT "$cpu ";
+		}
+		print CHART_SCRIPT '</td></tr>\n" >> chart.html' . "\n";
+	    }
+	    print CHART_SCRIPT 'echo -e "</table>\n" >> chart.html' . "\n";
+
+	    print CHART_SCRIPT 'for i in `ls -1 NUMA*.png`; do' . "\n";
+	    print CHART_SCRIPT '  echo -e "<table>\n<tr valign=\'top\'>\n" >> chart.html' . "\n";
+	    print CHART_SCRIPT '  echo -e "<td><img src=\'$i\'></td>\n" >> chart.html' . "\n";
+	    print CHART_SCRIPT '  html_file=`echo $i | sed -e "s/png/html/"`' . "\n";
+	    print CHART_SCRIPT '  if [ -e $html_file ]; then' . "\n";
+	    print CHART_SCRIPT '    echo -e "<td>\n" >> chart.html' . "\n";
+	    print CHART_SCRIPT '    cat $html_file >> chart.html' . "\n";
+	    print CHART_SCRIPT '    echo -e "</td>\n" >> chart.html' . "\n";
+	    print CHART_SCRIPT '  fi' . "\n";
+	    print CHART_SCRIPT '  echo -e "</tr>\n</table>\n" >> chart.html' . "\n";
+	    print CHART_SCRIPT 'done' . "\n\n";
+	}
+
+	print CHART_SCRIPT 'echo -e "</body>\n</html>\n" >> chart.html' . "\n";
+
+	close CHART_SCRIPT;
+    }
+}

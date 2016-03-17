@@ -1,0 +1,230 @@
+#!/usr/bin/perl
+
+#
+# LPCPU (Linux Performance Customer Profiler Utility): ./postprocess/postprocess-kvmstat
+#
+# (C) Copyright IBM Corp. 2016
+#
+# This file is subject to the terms and conditions of the Eclipse
+# Public License.  See the file LICENSE.TXT in the main directory of the
+# distribution for more details.
+#
+
+
+# postprocess the kvm_stat profiler data (provides an average for each stat)
+
+use strict;
+#use Data::Dumper;
+use autobench::strings;
+use autobench::time;
+use autobench::jschart;
+
+my $working_directory = $ARGV[0];
+my $identifier = $ARGV[1];
+my $invocation_id;
+my $input_file;
+my $line;
+my $got_header = 0;
+my $sample_value;
+my @header;
+my @data;
+my %data_sum;
+my $count = 0;
+my @plotfile_filehandles;
+
+if (@ARGV < 1) {
+    print STDERR "postprocess-kvmstat: No working directory specified\n";
+    exit 1;
+}
+
+if (@ARGV < 2) {
+    print STDERR "postprocess-kvmstat: No identifier specified\n";
+    exit 1;
+}
+
+if (@ARGV > 2) {
+    $invocation_id = $ARGV[2];
+    $input_file = "kvmstat." . $invocation_id . "." . $identifier;
+} else {
+    $input_file = "kvmstat." . $identifier;
+}
+
+print "Processing File : $input_file\n";
+
+
+if (!open(INPUT,"<$working_directory/$input_file")) {
+    print STDERR "postprocess-kvmstat: could not open specified input file\n";
+    exit 1;
+}
+
+my $output_directory;
+if (@ARGV > 2) {
+    $output_directory = "$working_directory/kvmstat-processed.$invocation_id.$identifier";
+} else {
+    $output_directory = "$working_directory/kvmstat-processed.$identifier";
+}
+mkdir $output_directory;
+mkdir "$output_directory/plot-files";
+my $header_len = 0;
+
+my $start_index = 0;
+my $initial_timestamp = -1;
+my $current_timestamp = -1;
+my $last_timestamp = -1;
+my $timestamp_wrap_adjustment = 0;
+
+while (<INPUT>) {
+    chomp($line = $_);
+    if ($line =~ /[a-zA-Z]/) {
+	if ($got_header == 0) {
+	    @header = split(" ", $line);
+
+	    if ($header[0] =~ /Time/) {
+		$start_index = 1;
+	    }
+
+	    for (my $i=$start_index; $i<@header; $i++) {
+		if (! open($plotfile_filehandles[$i], ">$output_directory/plot-files/$header[$i].plot")) {
+		    print STDERR "postprocess-kvmstat: ERROR: could not open $output_directory/plot-files/$header[$i].plot for writing\n";
+		} else {
+		    print { $plotfile_filehandles[$i] } "#LABEL:$header[$i]\n";
+		}
+		if (length($header[$i]) > $header_len) {
+		    $header_len = length($header[$i]);
+		}
+	    }
+
+	    $got_header = 1;
+	}
+	next;
+    } else {
+	@data = split(" ", $line);
+
+	my $index = $count;
+
+	if ($start_index) {
+	    $last_timestamp = $current_timestamp;
+
+	    $current_timestamp = time_in_seconds($data[0]);
+
+	    if ($initial_timestamp == -1) {
+		$initial_timestamp = $current_timestamp;
+	    }
+
+	    # check if the timestamps have wrapped, give 5% leeway just in case sample timestamps are out of
+	    # order for some bizarre reason
+	    if ($current_timestamp < ($last_timestamp * .95)) {
+		# add another day's worth of seconds to the adjustment value
+		$timestamp_wrap_adjustment += 24*60*60;
+	    }
+
+	    $index = $current_timestamp - $initial_timestamp + $timestamp_wrap_adjustment;
+
+	    shift (@data);
+	}
+
+	for (my $i=$start_index; $i<@header; $i++) {
+	    $sample_value = shift(@data);
+	    $data_sum{$header[$i]} += $sample_value;
+	    print { $plotfile_filehandles[$i] } "$index $sample_value\n";
+	}
+	$count++;
+    }
+}
+
+for (my $i=$start_index; $i<@header; $i++) {
+    close $plotfile_filehandles[$i];
+}
+
+open(OUTPUT, ">$output_directory/kvmstat-summary.txt");
+foreach (@header) {
+    if ($_ =~ /Time/) {
+	next;
+    }
+    printf OUTPUT "%-$header_len" . "s %d\n", $_, ($data_sum{$_}/$count);
+}
+close OUTPUT;
+
+if (! $ENV{'FORCE_CHART_PL'}) {
+    my $chart_page = new autobench::jschart("kvm_stat charts");
+    if ($ENV{'FORCE_JSCHART_REMOTE_LIBRARY'}) {
+	$chart_page->set_library_remote;
+    }
+
+    $chart_page->enable_raw_data_file_links('../');
+
+    my $y_label;
+    if ($start_index) {
+	$y_label = "Events/Second";
+    } else {
+	$y_label = "Events Per Interval";
+    }
+
+    $chart_page->add_link('summary_link', 'kvmstat-summary.txt', 'Summary');
+
+    for (my $i=$start_index; $i<@header; $i++) {
+	$chart_page->add_chart($header[$i], 'line', $header[$i], 'Time (secs.)', $y_label);
+	$chart_page->add_plots($header[$i], $header[$i]);
+	$chart_page->add_raw_data_sources($header[$i], $input_file);
+    }
+
+    if (!open(CHART_HTML, ">$output_directory/chart.html")) {
+	print STDERR "postprocess-kvmstat: Could not create chart.html file\n";
+	exit 1;
+    } else {
+	chmod (0644, "$output_directory/chart.html");
+
+	print CHART_HTML $chart_page->dump_page;
+
+	close CHART_HTML;
+    }
+} else {
+    if (!open(CHART_SCRIPT, ">$output_directory/chart.sh")) {
+	print STDERR "postprocess-momd: Could not create chart.sh file\n";
+	exit 1;
+    } else {
+	chmod (0777, "$output_directory/chart.sh");
+
+	print CHART_SCRIPT "#!/bin/bash\n\n";
+	print CHART_SCRIPT 'DIR=`dirname $0`' . "\n\n";
+	print CHART_SCRIPT 'if [ $# != 2 ]; then' . "\n";
+	print CHART_SCRIPT '  echo "You must specify the path to the chart.pl script and the Chart Directory libraries."' . "\n";
+	print CHART_SCRIPT '  exit 1' . "\n";
+	print CHART_SCRIPT 'fi' . "\n\n";
+	print CHART_SCRIPT 'SCRIPT=$1' . "\n";
+	print CHART_SCRIPT 'LIBRARIES=$2' . "\n\n";
+	print CHART_SCRIPT 'export PERL5LIB=$LIBRARIES' . "\n\n";
+	print CHART_SCRIPT 'pushd $DIR > /dev/null' . "\n\n";
+
+	my $y_label;
+	if ($start_index) {
+	    $y_label = "Events/Second";
+	} else {
+	    $y_label = "Events Per Interval";
+	}
+
+	for (my $i=$start_index; $i<@header; $i++) {
+	    print CHART_SCRIPT '$SCRIPT --table html -s lines -t "' . $header[$i] . '" -x "Time" -y "' . $y_label . '" plot-files/' .  $header[$i] . '.plot' . "\n";
+	}
+	print CHART_SCRIPT "\n";
+
+	print CHART_SCRIPT 'echo -e "<html>\n<head>\n<title>kvm_stat Charts</title>\n</head>\n<body>\n" > chart.html' . "\n";
+
+	print CHART_SCRIPT 'echo -e "<a href=\'kvmstat-summary.txt\'>Summary</a><br/><br/>\n" >> chart.html' . "\n";
+
+	print CHART_SCRIPT 'for i in `ls -1 *.png`; do' . "\n";
+	print CHART_SCRIPT '  echo -e "<table>\n<tr valign=\'top\'>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  echo -e "<td><img src=\'$i\'></td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  html_file=`echo $i | sed -e "s/png/html/"`' . "\n";
+	print CHART_SCRIPT '  if [ -e $html_file ]; then' . "\n";
+	print CHART_SCRIPT '    echo -e "<td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '    cat $html_file >> chart.html' . "\n";
+	print CHART_SCRIPT '    echo -e "</td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  fi' . "\n";
+	print CHART_SCRIPT '  echo -e "</tr>\n</table>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT 'done' . "\n\n";
+	print CHART_SCRIPT 'echo -e "</body>\n</html>\n" >> chart.html' . "\n";
+
+	close CHART_SCRIPT;
+    }
+}

@@ -1,0 +1,168 @@
+#!/usr/bin/perl
+
+#
+# LPCPU (Linux Performance Customer Profiler Utility): ./tools/lseth
+#
+# (C) Copyright IBM Corp. 2016
+#
+# This file is subject to the terms and conditions of the Eclipse
+# Public License.  See the file LICENSE.TXT in the main directory of the
+# distribution for more details.
+#
+
+
+use strict;
+
+use Getopt::Long;
+
+
+sub usage()
+{
+	print "Usage: $0 [-v] [-h]\n";
+	exit(1);
+}
+
+my $sysfs = "/sys/class/net";
+my $dtree = "/proc/device-tree";
+
+Getopt::Long::Configure( 'bundling', 'no_permute' );
+my $verbose  = '';
+my $help     = '';
+my $rc = Getopt::Long::GetOptions(
+		'v' => \$verbose,
+		'h'  => \$help,
+	);
+
+usage() unless($rc);
+
+die("Sysfs network class, $sysfs, does not exist\n") unless (-d $sysfs);
+
+opendir(DIR, $sysfs) || die("Unable to opendir $sysfs: $!\n");
+my @tmp_names = grep { /^eth/ } readdir(DIR);
+closedir(DIR);
+my @eth_names = sort { ($a =~ /eth(\d+)/)[0] <=> ($b =~ /eth(\d+)/)[0] } @tmp_names;
+
+my $pci_re = '^[\da-fA-F][\da-fA-F][\da-fA-F][\da-fA-F]:[\da-fA-F][\da-fA-F]:[\da-fA-F][\da-fA-F]\.[\da-fA-F]';
+my $hea_re = '^([\da-fA-F]+)\.lhea';
+
+my $d_path, my $d_pci, my $d_hea;
+my %eth_devices = ();
+my %eth_descs   = ();
+my %eth_macs    = ();
+my %eth_states  = ();
+my %eth_speeds  = ();
+my %eth_formats = 0;
+foreach my $eth_name (@eth_names) {
+	$eth_formats{'name'} = length($eth_name) if (length($eth_name) > $eth_formats{'name'});
+
+	$eth_devices{$eth_name} = '';
+	$eth_descs{$eth_name}   = '***';
+	$eth_macs{$eth_name}    = '--:--:--:--:--:--';
+	$eth_states{$eth_name}  = 'unknown';
+	$eth_speeds{$eth_name}  = 'unknown';
+
+	if (-e "$sysfs/$eth_name/device") {
+		$d_path = `readlink -f "$sysfs/$eth_name/device"`;
+		chomp $d_path;
+		do {
+			$d_pci = `basename $d_path`;
+			chomp $d_pci;
+			$d_path = `dirname $d_path`;
+			chomp $d_path;
+		} until (($d_pci =~ /$pci_re/) || ($d_path eq '/'));
+
+		$eth_devices{$eth_name} = $d_pci if ($d_pci =~ /$pci_re/);
+	}
+
+	if (($eth_devices{$eth_name} eq '') && (-e $dtree)) {
+		$d_path = `readlink -f "$sysfs/$eth_name/device"`;
+		chomp $d_path;
+		do {
+			$d_hea = `basename $d_path`;
+			chomp $d_hea;
+			$d_path = `dirname $d_path`;
+			chomp $d_path;
+		} until (($d_hea =~ /$hea_re/) || ($d_path eq '/'));
+
+		$eth_devices{$eth_name} = $d_hea if ($d_hea =~ /$hea_re/);
+	}
+
+	if (-e "$sysfs/$eth_name/address") {
+		my $mac = `cat "$sysfs/$eth_name/address" 2>/dev/null`;
+		chomp $mac;
+		$eth_macs{$eth_name} = $mac if ($mac ne '');
+	}
+
+	if (-e "$sysfs/$eth_name/operstate") {
+		my $state = `cat "$sysfs/$eth_name/operstate" 2>/dev/null`;
+		chomp $state;
+		$eth_states{$eth_name} = $state if ($state ne '');
+
+		$eth_formats{'state'} = length($eth_states{$eth_name}) if (length($eth_states{$eth_name}) > $eth_formats{'state'});
+	}
+
+	if (-e "$sysfs/$eth_name/speed") {
+		my $speed = `cat "$sysfs/$eth_name/speed" 2>/dev/null`;
+		chomp $speed;
+		$eth_speeds{$eth_name} = $speed if ($speed ne '');
+
+		$eth_formats{'speed'} = length($eth_speeds{$eth_name}) if (length($eth_speeds{$eth_name}) > $eth_formats{'speed'});
+	}
+}
+
+open(LSPCI, "lspci |") || die("Unable to spawn lspci command: $!\n");
+while (<LSPCI>) {
+	chomp;
+
+	if (/^([^\s]+)\s+[^:]+:\s+(.*)/) {
+		my $pci_dev  = $1;
+		my $pci_desc = $2;
+
+		$pci_dev = "0000:$pci_dev" if ($pci_dev !~ /$pci_re/);
+
+		foreach my $eth_name (@eth_names) {
+			$eth_descs{$eth_name} = $pci_desc if ($eth_devices{$eth_name} eq $pci_dev);
+		}
+	}
+}
+close(LSPCI);
+
+if (-e $dtree) {
+	# Check for virtualized POWER adapters
+	foreach my $eth_name (@eth_names) {
+		next if ($eth_descs{$eth_name} ne '***');
+
+		if ($eth_devices{$eth_name} =~ /$hea_re/) {
+			my $hea_addr = $1;
+			opendir(DIR, $dtree) || die("Unable to opendir $dtree: $!\n");
+			my @hea_dirs = grep { /^lhea.$hea_addr/ } readdir(DIR);
+			closedir(DIR);
+
+			next unless (@hea_dirs);
+			my $hea_dir = $hea_dirs[0];
+
+			opendir(DIR, "$dtree/$hea_dir") || die("Unable to opendir $dtree/$hea_dir: $!\n");
+			my @eth_dirs = grep { /^ethernet/ } readdir(DIR);
+			closedir(DIR);
+
+			next unless (@eth_dirs);
+			my $eth_dir = $eth_dirs[0];
+
+			my $fname = sprintf("%s/%s/%s/ibm,fw-adapter-name", $dtree, $hea_dir, $eth_dir);
+			my $dname = `cat $fname`;
+			chomp $dname;
+			$eth_descs{$eth_name} = $dname;
+		}
+	}
+}
+
+my $name_fmt  = sprintf("%%-%ds", $eth_formats{'name'});
+my $state_fmt = sprintf("%%-%ds", $eth_formats{'state'});
+my $speed_fmt = sprintf("%%-%ds", $eth_formats{'speed'});
+for my $eth_name (@eth_names) {
+	if ($verbose) {
+		printf("$name_fmt (%s  status=$state_fmt  speed=$speed_fmt): %s\n", $eth_name, $eth_macs{$eth_name}, $eth_states{$eth_name}, $eth_speeds{$eth_name}, $eth_descs{$eth_name});
+	} else {
+		printf("$name_fmt (%s): %s\n", $eth_name, $eth_macs{$eth_name}, $eth_descs{$eth_name});
+	}
+}

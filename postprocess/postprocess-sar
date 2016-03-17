@@ -1,0 +1,1623 @@
+#!/usr/bin/perl
+
+#
+# LPCPU (Linux Performance Customer Profiler Utility): ./postprocess/postprocess-sar
+#
+# (C) Copyright IBM Corp. 2016
+#
+# This file is subject to the terms and conditions of the Eclipse
+# Public License.  See the file LICENSE.TXT in the main directory of the
+# distribution for more details.
+#
+
+
+# postprocess the sar profiler data
+
+use strict;
+#use Data::Dumper;
+use autobench::time;
+use autobench::strings;
+use autobench::numbers;
+use autobench::jschart;
+use Cwd;
+
+if (@ARGV < 1) {
+    print STDERR "postprocess-sar: No working directory specified\n";
+    exit 1;
+}
+
+if (@ARGV < 2) {
+    print STDERR "postprocess-sar: No identifier specified\n";
+    exit 1;
+}
+
+my $working_directory = $ARGV[0];
+my $identifier = $ARGV[1];
+
+my $full_sar_text;
+my $input_directory;
+my $invocation_id;
+
+if (@ARGV > 2) {
+    $invocation_id = $ARGV[2];
+
+    $input_directory = "sar.breakout." . $invocation_id . "." . $identifier;
+    $full_sar_text = "sar.text." . $invocation_id . "." . $identifier;
+} else {
+    $input_directory = "sar.breakout." . $identifier;
+    $full_sar_text = "sar.text." . $identifier;
+}
+
+print "Processing Directory : $input_directory\n";
+
+my $output_directory;
+if (@ARGV > 2) {
+    $output_directory = "$working_directory/sar-processed.$invocation_id.$identifier";
+} else {
+    $output_directory = "$working_directory/sar-processed.$identifier";
+}
+mkdir $output_directory;
+mkdir "$output_directory/plot-files";
+
+my $sar_run_mode =  process_run_queue_data();
+my $sar_memory_mode = process_memory_data();
+my $process_creation = process_process_creation_data();
+process_swapping_data();
+process_interrupts_data();
+my $ctx_switch = process_context_switch_data();
+my $pwr_mgmt = process_pwr_mgmt_data();
+my %network_plotfiles = process_network_data();
+my %cpu_plotfiles = process_cpu_data();
+process_paging_data();
+
+#########################################################################################################################
+
+if (! $ENV{'FORCE_CHART_PL'}) {
+    my $chart_page = new autobench::jschart("SAR Charts");
+    if ($ENV{'FORCE_JSCHART_REMOTE_LIBRARY'}) {
+	$chart_page->set_library_remote;
+    }
+
+    if (! $ENV{'FORCE_JSCHART_NO_PACKED_PLOTFILES'}) {
+	$chart_page->enable_packed_plotfiles($output_directory);
+    }
+
+    $chart_page->enable_raw_data_file_links('../' . $input_directory);
+
+    $chart_page->add_link('timestamps', 'timestamps.txt', 'Plot Interval to Timestamp Mapping');
+
+    $chart_page->add_link('full-sar-data', '../' . $full_sar_text, 'Full Sar Text Data');
+
+    $chart_page->add_chart('cpu', 'line', 'CPU Utilization', 'Time (secs.)', 'CPU Utilization');
+    $chart_page->add_axis_range_bound('cpu', 'y', 'min', 0);
+    $chart_page->add_axis_range_bound('cpu', 'y', 'max', 100);
+    @{$cpu_plotfiles{'array'}} = sort { substr($a, 4) <=> substr($b, 4) } @{$cpu_plotfiles{'array'}};
+    $chart_page->add_plots('cpu', @{$cpu_plotfiles{'array'}});
+    my $old_dir = getcwd();
+    if (chdir("$working_directory/$input_directory")) {
+	$chart_page->add_raw_data_sources('cpu', sort { substr($a, 13) <=> substr($b, 13) } glob("sar.cpu_util_*"));
+
+	chdir($old_dir);
+    }
+
+    $chart_page->add_chart('networkthroughputbw', 'line', 'Network Throughput (KBytes/sec.)', 'Time (secs.)', 'KBytes/sec.');
+    $chart_page->add_plots('networkthroughputbw', @{$network_plotfiles{'arrays'}{'bw'}});
+    $chart_page->add_raw_data_sources('networkthroughputbw', 'sar.netdev');
+
+    $chart_page->add_chart('networkthroughputbps', 'line', 'Network Throughput (MBits/sec.)', 'Time (secs.)', 'Mbits/sec.');
+    $chart_page->add_plots('networkthroughputbps', @{$network_plotfiles{'arrays'}{'bps'}});
+    $chart_page->add_raw_data_sources('networkthroughputbps', 'sar.netdev');
+
+    if (exists $network_plotfiles{'arrays'}{'util'}) {
+	$chart_page->add_chart('networkutilization', 'line', 'Network Utilization', 'Time (secs.)', '%');
+	$chart_page->add_plots('networkutilization', @{$network_plotfiles{'arrays'}{'util'}});
+	$chart_page->add_raw_data_sources('networkutilization', 'sar.netdev');
+    }
+
+    $chart_page->add_chart('networkpacketrate', 'line', 'Network Packet Rate', 'Time (secs.)', 'Packets/sec.');
+    $chart_page->add_plots('networkpacketrate', @{$network_plotfiles{'arrays'}{'packets'}});
+    $chart_page->add_raw_data_sources('networkpacketrate', 'sar.netdev');
+
+    $chart_page->add_chart('networkpacketsize', 'line', 'Network Packet Size', 'Time (secs.)', 'Bytes/packet');
+    $chart_page->add_plots('networkpacketsize', @{$network_plotfiles{'arrays'}{'packet_size'}});
+    $chart_page->add_raw_data_sources('networkpacketsize', 'sar.netdev');
+
+    $chart_page->add_chart('networkdrops', 'line', 'Network Drops', 'Time (secs.)', 'Drops/sec.');
+    $chart_page->add_plots('networkdrops', @{$network_plotfiles{'arrays'}{'drops'}});
+    $chart_page->add_raw_data_sources('networkdrops', 'sar.netdev');
+
+    $chart_page->add_chart('networkretransmits', 'line', 'Network Retransmits', 'Time (secs.)', 'Retransmits/sec.');
+    $chart_page->add_plots('networkretransmits', @{$network_plotfiles{'arrays'}{'retran'}});
+    $chart_page->add_raw_data_sources('networkretransmits', 'sar.netdev');
+
+    $chart_page->add_chart('ctxswitches', 'line', 'Context Switches', 'Time (secs.)', 'Context Switches/sec.');
+    $chart_page->add_plots('ctxswitches', 'context_switching');
+    $chart_page->add_raw_data_sources('ctxswitches', $ctx_switch);
+
+    $chart_page->add_chart('interrupts', 'line', 'Interrupts', 'Time (secs.)', 'Interrupts/sec.');
+    $chart_page->add_plots('interrupts', 'interrupts');
+    $chart_page->add_raw_data_sources('interrupts', 'sar.irq_sum');
+
+    if ($process_creation) {
+	$chart_page->add_chart('processcreation', 'line', 'Process Creation', 'Time (secs.)', 'Processes Created/sec.');
+	$chart_page->add_plots('processcreation', 'process-creation');
+	$chart_page->add_raw_data_sources('processcreation', $process_creation);
+    }
+
+    $chart_page->add_chart('memory', 'stacked', 'Memory', 'Time (secs.)', 'KB of Memory');
+    $chart_page->add_plots('memory', ('mem-buffers', 'mem-cached', 'mem-other', 'mem-free'));
+    $chart_page->add_raw_data_sources('memory', 'sar.memory');
+
+    if ($sar_memory_mode) {
+	$chart_page->add_chart('memorycommit', 'line', 'Memory Commit', 'Time (secs.)', 'KB of Commit');
+	$chart_page->add_plots('memorycommit', 'commit');
+	$chart_page->add_raw_data_sources('memorycommit', 'sar.memory');
+
+	$chart_page->add_chart('percentmemory', 'line', 'Percent Memory Used', 'Time (secs.)', 'Percent');
+	$chart_page->add_axis_range_bound('percentmemory', 'y', 'min', 0);
+	$chart_page->add_axis_range_bound('percentmemory', 'y', 'max', 100);
+	$chart_page->add_plots('percentmemory', ('mem-used-percent', 'commit-percent'));
+	$chart_page->add_raw_data_sources('percentmemory', 'sar.memory');
+
+	if ($sar_memory_mode == 3) {
+	    $chart_page->add_chart('dirtymemory', 'line', 'Dirty Memory', 'Time (secs.)', 'KB of Dirty');
+	    $chart_page->add_plots('dirtymemory', 'dirty');
+	    $chart_page->add_raw_data_sources('dirtymemory', 'sar.memory');
+	}
+    } else {
+	$chart_page->add_chart('swap', 'stacked', 'Swap', 'Time (secs.)', 'KB of Swap');
+	$chart_page->add_plots('swap', ('swap-used', 'swap-free'));
+	$chart_page->add_raw_data_sources('swap', 'sar.memory');
+
+	$chart_page->add_chart('percentmemory', 'line', 'Percent Memory Used', 'Time (secs.)', 'Percent');
+	$chart_page->add_axis_range_bound('percentmemory', 'y', 'min', 0);
+	$chart_page->add_axis_range_bound('percentmemory', 'y', 'max', 100);
+	$chart_page->add_plots('percentmemory', ('mem-used-percent', 'swap-used-percent'));
+	$chart_page->add_raw_data_sources('percentmemory', 'sar.memory');
+    }
+
+    $chart_page->add_chart('swapping', 'line', 'Swapping', 'Time (secs.)', 'Pages Swapped/sec.');
+    $chart_page->add_plots('swapping', ('swap-in', 'swap-out'));
+    $chart_page->add_raw_data_sources('swapping', 'sar.swapping');
+
+    $chart_page->add_chart('runnable', 'line', 'Runnable Processes', 'Time (secs.)', 'Processes in the Run Queue');
+    $chart_page->add_plots('runnable', 'run-queue-size');
+    $chart_page->add_raw_data_sources('runnable', 'sar.run_queue_loadavg');
+
+    $chart_page->add_chart('totalprocesses', 'line', 'Total Processes', 'Time (secs.)', 'Process List Size');
+    $chart_page->add_plots('totalprocesses', 'process-list-size');
+    $chart_page->add_raw_data_sources('totalprocesses', 'sar.run_queue_loadavg');
+
+    $chart_page->add_chart('loadaverages', 'line', 'Load Averages', 'Time (secs.)', 'Rolling Load Average');
+    $chart_page->add_plots('loadaverages', ('load-average-1', 'load-average-5', 'load-average-15'));
+    $chart_page->add_raw_data_sources('loadaverages', 'sar.run_queue_loadavg');
+
+    if ($pwr_mgmt) {
+	$chart_page->add_chart('procfreq', 'line', 'Processor Frequency', 'Time (secs.)', 'Frequency (MHz)');
+	$chart_page->add_plots('procfreq', 'frequency');
+	$chart_page->add_raw_data_sources('procfreq', 'sar.pwr_mgmt');
+    }
+
+    if ($sar_run_mode == 2) {
+	$chart_page->add_chart('blockedprocesses', 'line', 'Blocked Processes', 'Time (secs.)', 'Number of Blocked Processes');
+	$chart_page->add_plots('blockedprocesses', 'blocked-processes');
+	$chart_page->add_raw_data_sources('blockedprocesses', 'sar.run_queue_loadavg');
+    }
+
+    $chart_page->add_chart('vmmpaging', 'line', 'VMM Paging', 'Time (secs.)', 'KB/sec.');
+    $chart_page->add_plots('vmmpaging', ('paged-in', 'paged-out'));
+    $chart_page->add_raw_data_sources('vmmpaging', 'sar.paging_stats');
+
+    $chart_page->add_chart('vmmfaults', 'line', 'VMM Page Faults', 'Time (secs.)', 'Faults/sec.');
+    $chart_page->add_plots('vmmfaults', ('minor-faults', 'major-faults'));
+    $chart_page->add_raw_data_sources('vmmfaults', 'sar.paging_stats');
+
+    $chart_page->add_chart('vmmpagescanning', 'line', 'VMM Page Scanning', 'Time (secs.)', 'Pages/sec.');
+    $chart_page->add_plots('vmmpagescanning', ('kswapd-page-scans', 'direct-page-scans', 'reclaimed-pages'));
+    $chart_page->add_raw_data_sources('vmmpagescanning', 'sar.paging_stats');
+
+    $chart_page->add_chart('vmmefficiency', 'line', 'VMM Page Reclaim Efficiency', 'Time (secs.)', '% of Scanned Pages Reaped');
+    $chart_page->add_axis_range_bound('vmmefficiency', 'y', 'min', 0);
+    $chart_page->add_axis_range_bound('vmmefficiency', 'y', 'max', 100);
+    $chart_page->add_plots('vmmefficiency', 'vm-efficiency');
+    $chart_page->add_legend_entries('vmmefficiency', 'Note: Zero value datapoints resulting from no scan activity have been omitted.');
+    $chart_page->add_raw_data_sources('vmmefficiency', 'sar.paging_stats');
+
+    if (!open(CHART_HTML, ">$output_directory/chart.html")) {
+	print STDERR "postprocess-sar: Could not create chart.html file\n";
+	exit 1;
+    } else {
+	chmod (0644, "$output_directory/chart.html");
+
+	print CHART_HTML $chart_page->dump_page;
+
+	close CHART_HTML;
+
+	if (! $ENV{'FORCE_JSCHART_NO_PACKED_PLOTFILES'}) {
+	    # clean up the non-packed plotfiles
+	    my $deleted_plotfile_count = unlink glob "$output_directory/plot-files/*.plot";
+	    #print "Deleted $deleted_plotfile_count plot files\n";
+	    if (! rmdir "$output_directory/plot-files") {
+		print STDERR "ERROR: Failed to delete $output_directory/plot-files!\n";
+	    }
+	}
+    }
+} else {
+    if (!open(CHART_SCRIPT, ">$output_directory/chart.sh")) {
+	print STDERR "postprocess-sar: Could not create chart.sh file\n";
+	exit 1;
+    } else {
+	chmod (0777, "$output_directory/chart.sh");
+
+	print CHART_SCRIPT "#!/bin/bash\n\n";
+	print CHART_SCRIPT 'DIR=`dirname $0`' . "\n\n";
+	print CHART_SCRIPT 'if [ $# != 2 ]; then' . "\n";
+	print CHART_SCRIPT '  echo "You must specify the path to the chart.pl script and the Chart Directory libraries."' . "\n";
+	print CHART_SCRIPT '  exit 1' . "\n";
+	print CHART_SCRIPT 'fi' . "\n\n";
+	print CHART_SCRIPT 'SCRIPT=$1' . "\n";
+	print CHART_SCRIPT 'LIBRARIES=$2' . "\n\n";
+	print CHART_SCRIPT 'export PERL5LIB=$LIBRARIES' . "\n\n";
+	print CHART_SCRIPT 'pushd $DIR > /dev/null' . "\n\n";
+
+	my $counter = 0;
+
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(++$counter, 2) . ' cpu utilization" -x "Time (secs.)" -y "CPU Utilization" --y-range=0:100 ' . $cpu_plotfiles{'list'} . "\n";
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(++$counter, 2) . ' network throughput" -x "Time (secs.)" -y "KBytes/sec" ' . $network_plotfiles{'bw'} . "\n";
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(++$counter, 2) . ' network throughput" -x "Time (secs.)" -y "Mbits/sec" ' . $network_plotfiles{'bps'} . "\n";
+	if (exists $network_plotfiles{'util'}) {
+	    print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(++$counter, 2) . ' network utilization" -x "Time (secs.)" -y "%" ' . $network_plotfiles{'util'} . "\n";
+	}
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(++$counter, 2) . ' network packet rate" -x "Time (secs.)" -y "packets/sec" ' . $network_plotfiles{'packets'} . "\n";
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(++$counter, 2) . ' network packet size" -x "Time (secs.)" -y "Bytes/packet" ' . $network_plotfiles{'packet_size'} . "\n";
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(++$counter, 2) . ' network drops" -x "Time (secs.)" -y "Drops/sec" ' . $network_plotfiles{'drops'} . "\n";
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(++$counter, 2) . ' network retransmits" -x "Time (secs.)" -y "Retransmits/sec" ' . $network_plotfiles{'retran'} . "\n";
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(++$counter, 2) . ' context switches" -x "Time (secs.)" -y "context switches/sec" plot-files/context_switching.plot' . "\n";
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(++$counter, 2) . ' interrupts" -x "Time (secs.)" -y "interrupts/sec" plot-files/interrupts.plot' . "\n";
+	if ($process_creation) {
+	    print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(++$counter, 2) . ' process creation" -x "Time (secs.)" -y "Processes Created/sec" plot-files/process-creation.plot' . "\n";
+	}
+	print CHART_SCRIPT '$SCRIPT --table html -s stackedlines --title "' . manual_prepend(++$counter, 2) . ' memory" -x "Time (secs.)" -y "KB of Memory" --y-range 0:* --legend-position=bottom plot-files/mem-free.plot plot-files/mem-buffers.plot plot-files/mem-cached.plot plot-files/mem-other.plot' . "\n";
+	if ($sar_memory_mode) {
+	    print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(++$counter, 2) . ' memory commit" -x "Time (secs.)" -y "KB of Commit" --legend-position=bottom plot-files/commit.plot' . "\n";
+	    print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(++$counter, 2) . ' percent memory used" -x "Time (secs.)" -y "Percent" --y-range=0:100 --legend-position=bottom plot-files/mem-used-percent.plot plot-files/commit-percent.plot' . "\n";
+
+	    if ($sar_memory_mode == 3) {
+		print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(++$counter, 2) . ' dirty memory" -x "Time (secs.)" -y "KB of Dirty" --legend-position=bottom plot-files/dirty.plot' . "\n";
+	    }
+	} else {
+	    print CHART_SCRIPT '$SCRIPT --table html -s stackedlines --title "' . manual_prepend(++$counter, 2) . ' swap" -x "Time (secs.)" -y "KB of Swap" --legend-position=bottom plot-files/swap-free.plot plot-files/swap-used.plot' . "\n";
+	    print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(++$counter, 2) . ' percent memory used" -x "Time (secs.)" -y "Percent" --y-range=0:100 --legend-position=bottom plot-files/mem-used-percent.plot plot-files/swap-used-percent.plot' . "\n";
+	}
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(++$counter, 2) . ' swapping" -x "Time (secs.)" -y "Pages Swapped/sec" --legend-position=bottom plot-files/swap-in.plot plot-files/swap-out.plot' . "\n";
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(++$counter, 2) . ' runnable processes" -x "Time (secs.)" -y "Processes in the Run Queue" plot-files/run-queue-size.plot' . "\n";
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(++$counter, 2) . ' total processes" -x "Time (secs.)" -y "Process List Size" plot-files/process-list-size.plot' . "\n";
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(++$counter, 2) . ' load averages" -x "Time (secs.)" -y "Rolling Load Average" --legend-position=bottom plot-files/load-average-1.plot plot-files/load-average-5.plot plot-files/load-average-15.plot' . "\n";
+	if ($pwr_mgmt) {
+	    print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(++$counter, 2) . ' processor frequency" -x "Time (secs.)" -y "Frequency (MHz)" plot-files/frequency.plot' . "\n";
+	}
+
+	if ($sar_run_mode == 2) {
+	    print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(++$counter, 2) . ' blocked processes" -x "Time (secs.)" -y "Number of Blocked Processes" plot-files/blocked-processes.plot' . "\n";
+	}
+
+	print CHART_SCRIPT 'echo -e "<html>\n<head>\n<title>SAR Charts</title>\n</head>\n<body>\n" > chart.html' . "\n";
+
+	print CHART_SCRIPT 'echo -e "<a href=\'timestamps.txt\'>Timestamps</a>\n" >> chart.html' . "\n";
+
+	print CHART_SCRIPT 'for i in `ls -1 *.png`; do' . "\n";
+	print CHART_SCRIPT '  echo -e "<table>\n<tr valign=\'top\'>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  echo -e "<td><img src=\'$i\'></td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  html_file=`echo $i | sed -e "s/png/html/"`' . "\n";
+	print CHART_SCRIPT '  if [ -e $html_file ]; then' . "\n";
+	print CHART_SCRIPT '    echo -e "<td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '    cat $html_file >> chart.html' . "\n";
+	print CHART_SCRIPT '    echo -e "</td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  fi' . "\n";
+	print CHART_SCRIPT '  echo -e "</tr>\n</table>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT 'done' . "\n\n";
+
+	print CHART_SCRIPT 'echo -e "</body>\n</html>\n" >> chart.html' . "\n";
+
+	close CHART_SCRIPT;
+    }
+}
+
+#########################################################################################################################
+# data processing functions
+
+sub process_run_queue_data {
+    if (!open(INPUT,"<$working_directory/$input_directory/sar.run_queue_loadavg")) {
+	print STDERR "ERROR: could not open sar.run_queue_loadavg\n";
+	return;
+    }
+
+    my $sar_mode = 1;
+    while (<INPUT>) {
+	if ($_ =~ /runq-sz/) {
+	    if ($_ =~ /blocked/) {
+		$sar_mode = 2;
+		print "SAR run queue data contains information on blocked processes\n";
+	    }
+
+	    last;
+	}
+    }
+
+    # seek back to the beginning of the file to start over
+    seek INPUT, 0, 0;
+
+    my $line;
+    my $mode = 0;
+
+    my @fields;
+    my $sar_start_sec = -1;
+    my $time;
+    my $prev_time = 0;
+    my $time_add = 0;
+
+    open(RQSIZE_OUTPUT, ">$output_directory/plot-files/run-queue-size.plot");
+    open(PLSIZE_OUTPUT, ">$output_directory/plot-files/process-list-size.plot");
+    open(LDAVG1_OUTPUT, ">$output_directory/plot-files/load-average-1.plot");
+    open(LDAVG5_OUTPUT, ">$output_directory/plot-files/load-average-5.plot");
+    open(LDAVG15_OUTPUT, ">$output_directory/plot-files/load-average-15.plot");
+
+    if ($sar_mode == 2) {
+	open(BLOCKED_OUTPUT, ">$output_directory/plot-files/blocked-processes.plot");
+    }
+
+    print RQSIZE_OUTPUT "#LABEL:Run Queue Size\n";
+    print PLSIZE_OUTPUT "#LABEL:Process List Size\n";
+    print LDAVG1_OUTPUT "#LABEL:1 Minute\n";
+    print LDAVG5_OUTPUT "#LABEL:5 Minute\n";
+    print LDAVG15_OUTPUT "#LABEL:15 Minute\n";
+
+    if ($sar_mode == 2) {
+	print BLOCKED_OUTPUT "#LABEL: blocked processes\n";
+    }
+
+    my $rqsize;
+    my $plsize;
+    my $ldavg1;
+    my $ldavg5;
+    my $ldavg15;
+    my $blocked;
+
+    while (<INPUT>) {
+	chomp($line = $_);
+
+	if ($line =~ /runq-sz/) {
+	    $mode = 1;
+	    @fields = split(" ", $line);
+	    my ($ts, $am_pm) = @fields[0..1];
+	    if ($am_pm =~ /^am|pm$/i) {
+		$ts .= " $am_pm";
+	    }
+	    $sar_start_sec = time_in_seconds($ts);
+	    $prev_time = $sar_start_sec;
+	    next;
+	}
+
+	if ($line =~ /Average/) {
+	    last;
+	}
+
+	if ($mode == 1) {
+	    @fields = split(" ", $line);
+	    my ($ts, $am_pm) = @fields[0..1];
+	    if ($am_pm =~ /^am|pm$/i) {
+		$ts .= " $am_pm";
+	    }
+	    $time = time_in_seconds($ts);
+	    if ($time < ($prev_time * .95)) {
+		$time_add += 24*60*60;
+	    }
+	    $prev_time = $time;
+	    $time += $time_add;
+
+	    if ($sar_mode == 2) {
+		$rqsize = $fields[@fields - 6];
+		$plsize = $fields[@fields - 5];
+		$ldavg1 = $fields[@fields - 4];
+		$ldavg5 = $fields[@fields - 3];
+		$ldavg15 = $fields[@fields - 2];
+		$blocked = $fields[@fields - 1];
+	    } else {
+		$rqsize = $fields[@fields - 5];
+		$plsize = $fields[@fields - 4];
+		$ldavg1 = $fields[@fields - 3];
+		$ldavg5 = $fields[@fields - 2];
+		$ldavg15 = $fields[@fields - 1];
+	    }
+
+	    print RQSIZE_OUTPUT ($time - $sar_start_sec) . " $rqsize\n";
+	    print PLSIZE_OUTPUT ($time - $sar_start_sec) . " $plsize\n";
+	    print LDAVG1_OUTPUT ($time - $sar_start_sec) . " $ldavg1\n";
+	    print LDAVG5_OUTPUT ($time - $sar_start_sec) . " $ldavg5\n";
+	    print LDAVG15_OUTPUT ($time - $sar_start_sec) . " $ldavg15\n";
+
+	    if ($sar_mode == 2) {
+		print BLOCKED_OUTPUT ($time - $sar_start_sec) . " $blocked\n";
+	    }
+	}
+    }
+
+    close INPUT;
+    close RQSIZE_OUTPUT;
+    close PLSIZE_OUTPUT;
+    close LDAVG1_OUTPUT;
+    close LDAVG5_OUTPUT;
+    close LDAVG15_OUTPUT;
+
+    if ($sar_mode == 2) {
+	close BLOCKED_OUTPUT;
+    }
+
+    return $sar_mode;
+}
+
+sub process_memory_data {
+    if (!open(INPUT,"<$working_directory/$input_directory/sar.memory")) {
+	print STDERR "ERROR: could not open sar.memory\n";
+	return;
+    }
+
+    my $sar_mode = 1;
+    while(<INPUT>) {
+	if ($_ =~ /kbmemfree/) {
+	    if ($_ =~ /kbswpfree/) {
+		$sar_mode = 0;
+		print "SAR memory data is from outside Autobench\n";
+	    } elsif ($_ =~ /kbdirty/) {
+		$sar_mode = 3;
+		print "SAR memory data contains dirty information\n";
+	    }  elsif ($_ =~ /kbactive/) {
+		$sar_mode = 2;
+		print "SAR memory data contains active and inactive information\n";
+	    }
+
+	    last;
+	}
+    }
+
+    # seek back to the beginning of the file to start over and reset the mode tracker
+    seek INPUT, 0, 0;
+
+    my $line;
+    my $mode = 0;
+
+    my @fields;
+    my $sar_start_sec = -1;
+    my $time;
+    my $prev_time;
+    my $time_add = 0;
+
+    open(MEMFREE_OUTPUT, ">$output_directory/plot-files/mem-free.plot");
+    open(MEMOTHER_OUTPUT, ">$output_directory/plot-files/mem-other.plot");
+    open(MEMBUFFERS_OUTPUT, ">$output_directory/plot-files/mem-buffers.plot");
+    open(MEMCACHED_OUTPUT, ">$output_directory/plot-files/mem-cached.plot");
+    open(MEMUSEDPERCENT_OUTPUT, ">$output_directory/plot-files/mem-used-percent.plot");
+    if ($sar_mode) {
+	open(COMMIT_OUTPUT, ">$output_directory/plot-files/commit.plot");
+	open(COMMITPERCENT_OUTPUT, ">$output_directory/plot-files/commit-percent.plot");
+
+	if ($sar_mode == 3) {
+	    open(DIRTY_OUTPUT, ">$output_directory/plot-files/dirty.plot");
+	}
+    } else {
+	open(SWAPFREE_OUTPUT, ">$output_directory/plot-files/swap-free.plot");
+	open(SWAPUSED_OUTPUT, ">$output_directory/plot-files/swap-used.plot");
+	open(SWAPUSEDPERCENT_OUTPUT, ">$output_directory/plot-files/swap-used-percent.plot");
+    }
+
+    print MEMFREE_OUTPUT "#LABEL:Free Memory\n";
+    print MEMOTHER_OUTPUT "#LABEL:Other Used Memory\n";
+    print MEMBUFFERS_OUTPUT "#LABEL:Memory Used for Buffers\n";
+    print MEMCACHED_OUTPUT "#LABEL:Memory Used for Cache\n";
+    print MEMUSEDPERCENT_OUTPUT "#LABEL:Percent Memory Used\n";
+    if ($sar_mode) {
+	print COMMIT_OUTPUT "#LABEL:Commit\n";
+	print COMMITPERCENT_OUTPUT "#LABEL:Percent Commit\n";
+
+	if ($sar_mode == 3) {
+	    print DIRTY_OUTPUT "#LABEL:Dirty\n";
+	}
+    } else {
+	print SWAPFREE_OUTPUT "#LABEL:Free Swap\n";
+	print SWAPUSED_OUTPUT "#LABEL:Used Swap\n";
+	print SWAPUSEDPERCENT_OUTPUT "#LABEL:Percent Swap Used\n";
+    }
+
+    my $memfree;
+    my $memused;
+    my $memused_percent;
+    my $buffers;
+    my $cache;
+    my $commit;
+    my $commit_percent;
+    my $swapfree;
+    my $swapused;
+    my $swapused_percent;
+    my $dirty;
+
+
+    while (<INPUT>) {
+	chomp($line = $_);
+
+	if ($line =~ /kbmemfree/) {
+	    $mode = 1;
+	    @fields = split(" ", $line);
+	    my ($ts, $am_pm) = @fields[0..1];
+	    if ($am_pm =~ /^am|pm$/i) {
+		$ts .= " $am_pm";
+	    }
+	    $sar_start_sec = time_in_seconds($ts);
+	    $prev_time = $sar_start_sec;
+	    next;
+	}
+
+	if ($line =~ /Average/) {
+	    last;
+	}
+
+	if ($mode == 1) {
+	    @fields = split(" ", $line);
+
+	    if ($sar_mode == 1) {
+		$memfree = $fields[@fields - 7];
+		$memused = $fields[@fields - 6];
+		$memused_percent = $fields[@fields - 5];
+		$buffers = $fields[@fields - 4];
+		$cache = $fields[@fields - 3];
+		$commit = $fields[@fields - 2];
+		$commit_percent = $fields[@fields - 1];
+	    } elsif ($sar_mode == 2) {
+		$memfree = $fields[@fields - 9];
+		$memused = $fields[@fields - 8];
+		$memused_percent = $fields[@fields - 7];
+		$buffers = $fields[@fields - 6];
+		$cache = $fields[@fields - 5];
+		$commit = $fields[@fields - 4];
+		$commit_percent = $fields[@fields - 3];
+	    } elsif ($sar_mode == 3) {
+		$memfree = $fields[@fields - 10];
+		$memused = $fields[@fields - 9];
+		$memused_percent = $fields[@fields - 8];
+		$buffers = $fields[@fields - 7];
+		$cache = $fields[@fields - 6];
+		$commit = $fields[@fields - 5];
+		$commit_percent = $fields[@fields - 4];
+		$dirty = $fields[@fields - 1];
+	    } else {
+		$memfree = $fields[@fields - 9];
+		$memused = $fields[@fields - 8];
+		$memused_percent = $fields[@fields - 7];
+		$buffers = $fields[@fields - 6];
+		$cache = $fields[@fields - 5];
+		$swapfree = $fields[@fields - 4];
+		$swapused = $fields[@fields - 3];
+		$swapused_percent = $fields[@fields - 2];
+	    }
+
+	    my $total_mem = $memfree + $memused;
+	    my $other_mem = $total_mem - $memfree - $buffers - $cache;
+
+	    my ($ts, $am_pm) = @fields[0..1];
+	    if ($am_pm =~ /^am|pm$/i) {
+		$ts .= " $am_pm";
+	    }
+	    $time = time_in_seconds($ts);
+	    if ($time < ($prev_time * .95)) {
+		$time_add += 24*60*60;
+	    }
+	    $prev_time = $time;
+	    $time += $time_add;
+
+	    print MEMFREE_OUTPUT ($time - $sar_start_sec) . " $memfree\n";
+	    print MEMOTHER_OUTPUT ($time - $sar_start_sec) . " $other_mem\n";
+	    print MEMBUFFERS_OUTPUT ($time - $sar_start_sec) . " $buffers\n";
+	    print MEMCACHED_OUTPUT ($time - $sar_start_sec) . " $cache\n";
+	    print MEMUSEDPERCENT_OUTPUT ($time - $sar_start_sec) . " $memused_percent\n";
+
+	    if ($sar_mode) {
+		print COMMIT_OUTPUT ($time - $sar_start_sec) . " $commit\n";
+		print COMMITPERCENT_OUTPUT ($time - $sar_start_sec) . " $commit_percent\n";
+
+		if ($sar_mode == 3) {
+		    print DIRTY_OUTPUT ($time - $sar_start_sec) . " $dirty\n";
+		}
+	    } else {
+		print SWAPFREE_OUTPUT ($time - $sar_start_sec) . " $swapfree\n";
+		print SWAPUSED_OUTPUT ($time - $sar_start_sec) . " $swapused\n";
+		print SWAPUSEDPERCENT_OUTPUT ($time - $sar_start_sec) . " $swapused_percent\n";
+	    }
+	}
+    }
+
+    close INPUT;
+    close MEMFREE_OUTPUT;
+    close MEMOTHER_OUTPUT;
+    close MEMBUFFERS_OUTPUT;
+    close MEMCACHED_OUTPUT;
+    close MEMUSEDPERCENT_OUTPUT;
+    if ($sar_mode) {
+	close COMMITFREE_OUTPUT;
+	close COMMITPERCENT_OUTPUT;
+
+	if ($sar_mode == 3) {
+	    close DIRTY_OUTPUT;
+	}
+    } else {
+	close SWAPFREE_OUTPUT;
+	close SWAPUSED_OUTPUT;
+	close SWAPUSEDPERCENT_OUTPUT;
+    }
+
+    return $sar_mode;
+}
+
+sub process_process_creation_data {
+    my $array_offset;
+
+    my $filename;
+
+    my $path = "$working_directory/$input_directory/";
+    my $new_filename = "sar.process_creation-context_switching";
+    my $old_filename = "sar.process_creation";
+    if ((-e "$path$new_filename") || (-e "$path$old_filename")) {
+	if ((-e "$path$new_filename") && (-e "$path$old_filename")) {
+	    if ((! -z "$path$new_filename") && (-z "$path$old_filename")) {
+		if (!open(INPUT, "<", "$path$new_filename")) {
+		    print STDERR "ERROR: could not open $new_filename.\n";
+		    return 0;
+		}
+		$filename = $new_filename;
+		$array_offset = 2;
+	    } elsif ((-z "$path$new_filename") && (! -z "$path$old_filename")) {
+		if (!open(INPUT, "<", "$path$old_filename")) {
+		    print STDERR "ERROR: could not open $old_filename.\n";
+		    return 0;
+		}
+		$filename = $old_filename;
+		$array_offset = 1;
+	    } else {
+		print STDERR "ERROR: $new_filename and $old_filename are empty files.\n";
+		return 0;
+	    }
+	} elsif (-e "$path$new_filename") {
+	    if (-z "$path$new_filename") {
+		print STDERR "ERROR: $new_filename is an empty file.\n";
+		return 0;
+	    } elsif (!open(INPUT, "<", "$path$new_filename")) {
+		print STDERR "ERROR: could not open $new_filename.\n";
+		return 0;
+	    }
+	    $filename = $new_filename;
+	    $array_offset = 2;
+	} else {
+	    if (-z "$path$old_filename") {
+		print STDERR "ERROR: $old_filename is an empty file.\n";
+		return 0;
+	    } elsif (!open(INPUT, "<", "$path$old_filename")) {
+		print STDERR "ERROR: could not open $old_filename.\n";
+		return 0;
+	    }
+	    $filename = $old_filename;
+	    $array_offset = 1;
+	}
+    } else {
+	print STDERR "ERROR: no process creation data exists.\n";
+	return 0;
+    }
+
+    my $line;
+    my $mode = 0;
+
+    my @fields;
+    my $sar_start_sec = -1;
+    my $time_from_start;
+    my $prev_time;
+    my $time_add = 0;
+
+    open(OUTPUT, ">$output_directory/plot-files/process-creation.plot");
+    print OUTPUT "#LABEL:Process Creation Rate\n";
+
+    while (<INPUT>) {
+	chomp($line = $_);
+
+	if ($line =~ /proc\/s/) {
+	    $mode = 1;
+	    @fields = split(" ", $line);
+	    my ($ts, $am_pm) = @fields[0..1];
+	    if ($am_pm =~ /^am|pm$/i) {
+		$ts .= " $am_pm";
+	    }
+	    $sar_start_sec = time_in_seconds($ts);
+	    $prev_time = $sar_start_sec;
+	    next;
+	}
+
+	if ($line =~ /Average/) {
+	    last;
+	}
+
+	if ($mode == 1) {
+	    @fields = split(" ", $line);
+	    my ($ts, $am_pm) = @fields[0..1];
+	    if ($am_pm =~ /^am|pm$/i) {
+		$ts .= " $am_pm";
+	    }
+
+	    $time_from_start = time_in_seconds($ts);
+	    if ($time_from_start < ($prev_time * .95)) {
+		$time_add += 24*60*60;
+	    }
+	    $prev_time = $time_from_start;
+	    $time_from_start += $time_add;
+
+	    print OUTPUT ($time_from_start - $sar_start_sec) . " $fields[@fields - $array_offset]\n";
+	}
+    }
+
+    close INPUT;
+    close OUTPUT;
+
+    return $filename;
+}
+
+sub process_swapping_data {
+    if (!open(INPUT,"<$working_directory/$input_directory/sar.swapping")) {
+	print STDERR "ERROR: could not open sar.swapping\n";
+	return;
+    }
+
+    my $line;
+    my $mode = 0;
+
+    my @fields;
+    my $sar_start_sec = -1;
+    my $time_from_start;
+    my $prev_time;
+    my $time_add = 0;
+
+    open(IN_OUTPUT, ">$output_directory/plot-files/swap-in.plot");
+    open(OUT_OUTPUT, ">$output_directory/plot-files/swap-out.plot");
+    print IN_OUTPUT "#LABEL:In\n";
+    print OUT_OUTPUT "#LABEL:Out\n";
+
+    while (<INPUT>) {
+	chomp($line = $_);
+
+	if ($line =~ /pswpin\/s/) {
+	    $mode = 1;
+	    @fields = split(" ", $line);
+	    my ($ts, $am_pm) = @fields[0..1];
+	    if ($am_pm =~ /^am|pm$/i) {
+		$ts .= " $am_pm";
+	    }
+	    $sar_start_sec = time_in_seconds($ts);
+	    $prev_time = $sar_start_sec;
+	    next;
+	}
+
+	if ($line =~ /Average/) {
+	    last;
+	}
+
+	if ($mode == 1) {
+	    @fields = split(" ", $line);
+	    my ($ts, $am_pm) = @fields[0..1];
+	    if ($am_pm =~ /^am|pm$/i) {
+		$ts .= " $am_pm";
+	    }
+	    $time_from_start = time_in_seconds($ts);
+	    if ($time_from_start < ($prev_time * .95)) {
+		$time_add += 24*60*60;
+	    }
+	    $prev_time = $time_from_start;
+	    $time_from_start += $time_add;
+
+	    print IN_OUTPUT  ($time_from_start - $sar_start_sec) . " $fields[@fields - 2]\n";
+	    print OUT_OUTPUT ($time_from_start - $sar_start_sec) . " $fields[@fields - 1]\n";
+	}
+    }
+
+    close INPUT;
+    close IN_OUTPUT;
+    close OUT_OUTPUT;
+}
+
+sub process_interrupts_data {
+    my $i;
+    my $x;
+
+    if (!open(INPUT,"<$working_directory/$input_directory/sar.irq_sum")) {
+	print STDERR "ERROR: could not open sar.irq_sum\n";
+	return;
+    }
+
+    my $line;
+    my $mode = 0;
+
+    my $num_devices = 0;
+    my @devices;
+    my @fields;
+    my $sar_start_sec = -1;
+    my $time_from_start;
+    my $prev_time;
+    my $time_add = 0;
+
+    open(TIME, ">$output_directory/timestamps.txt");
+    print TIME "Plot Interval to Timestamp Mapping:\n";
+
+    open(OUTPUT, ">$output_directory/plot-files/interrupts.plot");
+    print OUTPUT "#LABEL:interrupts/sec\n";
+
+    while (<INPUT>) {
+	chomp($line = $_);
+
+	if ($line =~ /intr\/s/) {
+	    $mode = 1;
+	    @fields = split(" ", $line);
+	    my ($ts, $am_pm) = @fields[0..1];
+	    if ($am_pm =~ /^am|pm$/i) {
+		$ts .= " $am_pm";
+	    }
+	    $sar_start_sec = time_in_seconds($ts);
+	    $prev_time = $sar_start_sec;
+	    next;
+	}
+
+	if ($line =~ /Average/) {
+	    last;
+	}
+
+	if ($mode == 1) {
+	    @fields = split(" ", $line);
+	    my ($ts, $am_pm) = @fields[0..1];
+	    if ($am_pm =~ /^am|pm$/i) {
+		$ts .= " $am_pm";
+	    }
+	    $time_from_start = time_in_seconds($ts);
+	    if ($time_from_start < ($prev_time * .95)) {
+		$time_add += 24*60*60;
+	    }
+	    $prev_time = $time_from_start;
+	    $time_from_start += $time_add;
+
+	    print TIME ($time_from_start - $sar_start_sec) . "\t\t" . $ts . "\n";
+	    print OUTPUT ($time_from_start - $sar_start_sec) . " $fields[@fields - 1]\n";
+	}
+    }
+
+    close TIME;
+    close OUTPUT;
+    close INPUT;
+}
+
+sub process_pwr_mgmt_data {
+    my $i;
+    my $x;
+
+    if (!open(INPUT,"<$working_directory/$input_directory/sar.pwr_mgmt")) {
+	print STDERR "ERROR: Could not open sar.pwr_mgmt.  WARNING: This data may not exist in your version of sar.\n";
+	return 0;
+    }
+
+    my $line;
+    my $mode = 0;
+
+    my $num_devices = 0;
+    my @devices;
+    my @fields;
+    my $sar_start_sec = -1;
+    my $time_from_start;
+    my $prev_time;
+    my $time_add = 0;
+
+    open(OUTPUT, ">$output_directory/plot-files/frequency.plot");
+    print OUTPUT "#LABEL:Frequency\n";
+
+    while (<INPUT>) {
+	chomp($line = $_);
+
+	if ($line =~ /MHz/) {
+	    $mode = 1;
+	    @fields = split(" ", $line);
+	    my ($ts, $am_pm) = @fields[0..1];
+	    if ($am_pm =~ /^am|pm$/i) {
+		$ts .= " $am_pm";
+	    }
+	    $sar_start_sec = time_in_seconds($ts);
+	    $prev_time = $sar_start_sec;
+	    next;
+	}
+
+	if ($line =~ /Average/) {
+	    last;
+	}
+
+	if ($mode == 1) {
+	    @fields = split(" ", $line);
+	    my ($ts, $am_pm) = @fields[0..1];
+	    if ($am_pm =~ /^am|pm$/i) {
+		$ts .= " $am_pm";
+	    }
+	    $time_from_start = time_in_seconds($ts);
+	    if ($time_from_start < ($prev_time * .95)) {
+		$time_add += 24*60*60;
+	    }
+	    $prev_time = $time_from_start;
+	    $time_from_start += $time_add;
+
+	    print OUTPUT ($time_from_start - $sar_start_sec) . " $fields[@fields - 1]\n";
+	}
+    }
+
+    close OUTPUT;
+    close INPUT;
+
+    return 1;
+}
+
+sub process_context_switch_data {
+    my $i;
+    my $x;
+
+    my $input_filename = "sar.process_creation-context_switching";
+
+    if (-e "$working_directory/$input_directory/$input_filename") {
+	if (!open(INPUT,"<$working_directory/$input_directory/$input_filename")) {
+	    print STDERR "ERROR: could not open $input_filename\n";
+	    return $input_filename;
+	}
+    } else {
+	$input_filename = "sar.context_switching";
+
+	if (!open(INPUT,"<$working_directory/$input_directory/$input_filename")) {
+	    print STDERR "ERROR: could not open $input_filename\n";
+	    return $input_filename;
+	}
+    }
+
+    my $line;
+    my $mode = 0;
+
+    my $num_devices = 0;
+    my @devices;
+    my @fields;
+    my $sar_start_sec = -1;
+    my $time_from_start;
+    my $prev_time;
+    my $time_add = 0;
+
+    open(OUTPUT, ">$output_directory/plot-files/context_switching.plot");
+    print OUTPUT "#LABEL:context switches/sec\n";
+
+    while (<INPUT>) {
+	chomp($line = $_);
+
+	if ($line =~ /cswch\/s/) {
+	    $mode = 1;
+	    @fields = split(" ", $line);
+	    my ($ts, $am_pm) = @fields[0..1];
+	    if ($am_pm =~ /^am|pm$/i) {
+		$ts .= " $am_pm";
+	    }
+	    $sar_start_sec = time_in_seconds($ts);
+	    $prev_time = $sar_start_sec;
+	    next;
+	}
+
+	if ($line =~ /Average/) {
+	    last;
+	}
+
+	if ($mode == 1) {
+	    @fields = split(" ", $line);
+	    my ($ts, $am_pm) = @fields[0..1];
+	    if ($am_pm =~ /^am|pm$/i) {
+		$ts .= " $am_pm";
+	    }
+	    $time_from_start = time_in_seconds($ts);
+	    if ($time_from_start < ($prev_time * .95)) {
+		$time_add = 24*60*60;
+	    }
+	    $prev_time = $time_from_start;
+	    $time_from_start += $time_add;
+
+	    print OUTPUT ($time_from_start - $sar_start_sec) . " $fields[@fields - 1]\n";
+	}
+    }
+
+    close OUTPUT;
+    close INPUT;
+
+    return $input_filename;
+}
+
+sub process_network_data {
+    my $i;
+    my $x;
+
+    if (!open(INPUT,"<$working_directory/$input_directory/sar.netdev")) {
+	print STDERR "ERROR: could not open sar.netdev\n";
+	return;
+    }
+
+    my $line;
+    my $mode = 0;
+    my $util = 0;
+
+    # assume data is in KiloBytes
+    my $unit_size = "KB";
+    my $unit_modifier;
+
+    my $num_devices = 0;
+    my @devices;
+    my @fields;
+
+    while (<INPUT>) {
+	chomp($line = $_);
+
+	if ($line =~ /IFACE.*rxbyt\/s/) {
+	    # data is actually in Bytes
+	    $unit_size = "B";
+	}
+
+	if ($line =~ /%ifutil/) {
+	    $util = 1;
+	}
+
+	if ($line =~ /IFACE.*rxpck\/s/) {
+	    $mode = 1;
+	    next;
+	}
+
+	if ($line =~ /IFACE.*rxerr\/s/) {
+	    last;
+	}
+
+	if (($line =~ /Average:/) && ($mode == 1)) {
+	    $num_devices++;
+	    @fields = split(" ", $line);
+	    push @devices, $fields[1];
+	}
+    }
+
+    # seek back to the beginning of the file to start over and reset the mode tracker
+    seek INPUT, 0, 0;
+    $mode = 0;
+
+    my @device_rx_file_handles;
+    my @device_tx_file_handles;
+    my @device_rx_bps_file_handles;
+    my @device_tx_bps_file_handles;
+    my @device_rx_packets_file_handles;
+    my @device_tx_packets_file_handles;
+    my @device_rx_packet_size_file_handles;
+    my @device_tx_packet_size_file_handles;
+    my @device_rx_drop_file_handles;
+    my @device_tx_drop_file_handles;
+    my @device_util_file_handles;
+    my $retran_file_handle;
+
+    my %plot_files;
+    $plot_files{'bw'} = "";
+    $plot_files{'arrays'}{'bw'} = ();
+    $plot_files{'bps'} = "";
+    $plot_files{'arrays'}{'bps'} = ();
+    $plot_files{'packets'} = "";
+    $plot_files{'arrays'}{'packets'} = ();
+    $plot_files{'packet_size'} = "";
+    $plot_files{'arrays'}{'packet_size'} = ();
+    $plot_files{'drops'} = "";
+    $plot_files{'arrays'}{'drops'} = ();
+    if ($util) {
+	$plot_files{'util'} = "";
+	$plot_files{'arrays'}{'util'} = ();
+    }
+    $plot_files{'retran'} = " plot-files/net.retrans.plot";
+    $plot_files{'arrays'}{'retran'} = ();
+    push @{$plot_files{'arrays'}{'retran'}}, 'net.retrans';
+
+    open($retran_file_handle, ">$output_directory/plot-files/net.retrans.plot");
+    print { $retran_file_handle } "#LABEL:network retransmits\n";
+
+    for($x=0; $x<@devices; $x++) {
+	open($device_rx_file_handles[$x], ">$output_directory/plot-files/net.$devices[$x].rx.plot");
+	print { $device_rx_file_handles[$x] } "#LABEL:$devices[$x] - rx\n";
+
+	open($device_tx_file_handles[$x], ">$output_directory/plot-files/net.$devices[$x].tx.plot");
+	print { $device_tx_file_handles[$x] } "#LABEL:$devices[$x] - tx\n";
+
+	open($device_rx_bps_file_handles[$x], ">$output_directory/plot-files/net.$devices[$x].rx_bps.plot");
+	print { $device_rx_bps_file_handles[$x] } "#LABEL:$devices[$x] - rx\n";
+
+	open($device_tx_bps_file_handles[$x], ">$output_directory/plot-files/net.$devices[$x].tx_bps.plot");
+	print { $device_tx_bps_file_handles[$x] } "#LABEL:$devices[$x] - tx\n";
+
+	open($device_rx_packets_file_handles[$x], ">$output_directory/plot-files/net.$devices[$x].rx.packets.plot");
+	print { $device_rx_packets_file_handles[$x] } "#LABEL:$devices[$x] - rx packets\n";
+
+	open($device_tx_packets_file_handles[$x], ">$output_directory/plot-files/net.$devices[$x].tx.packets.plot");
+	print { $device_tx_packets_file_handles[$x] } "#LABEL:$devices[$x] - tx packets\n";
+
+	open($device_rx_packet_size_file_handles[$x], ">$output_directory/plot-files/net.$devices[$x].rx.packet.size.plot");
+	print { $device_rx_packet_size_file_handles[$x] } "#LABEL:$devices[$x] - rx packet size\n";
+
+	open($device_tx_packet_size_file_handles[$x], ">$output_directory/plot-files/net.$devices[$x].tx.packet.size.plot");
+	print { $device_tx_packet_size_file_handles[$x] } "#LABEL:$devices[$x] - tx packet size\n";
+
+	open($device_rx_drop_file_handles[$x], ">$output_directory/plot-files/net.$devices[$x].rx.drop.plot");
+	print { $device_rx_drop_file_handles[$x] } "#LABEL:$devices[$x] - rx drops\n";
+
+	open($device_tx_drop_file_handles[$x], ">$output_directory/plot-files/net.$devices[$x].tx.drop.plot");
+	print { $device_tx_drop_file_handles[$x] } "#LABEL:$devices[$x] - tx drops\n";
+
+	if ($util) {
+	    open($device_util_file_handles[$x], ">$output_directory/plot-files/net.$devices[$x].util.plot");
+	    print { $device_util_file_handles[$x] } "#LABEL:$devices[$x] - utilization\n";
+	}
+
+	$plot_files{'bw'} .= " plot-files/net.$devices[$x].rx.plot plot-files/net.$devices[$x].tx.plot";
+	push @{$plot_files{'arrays'}{'bw'}}, ("net.$devices[$x].rx", "net.$devices[$x].tx");
+
+	$plot_files{'bps'} .= " plot-files/net.$devices[$x].rx_bps.plot plot-files/net.$devices[$x].tx_bps.plot";
+	push @{$plot_files{'arrays'}{'bps'}}, ("net.$devices[$x].rx_bps", "net.$devices[$x].tx_bps");
+
+	$plot_files{'packets'} .= " plot-files/net.$devices[$x].rx.packets.plot plot-files/net.$devices[$x].tx.packets.plot";
+	push @{$plot_files{'arrays'}{'packets'}}, ("net.$devices[$x].rx.packets", "net.$devices[$x].tx.packets");
+
+	$plot_files{'packet_size'} .= " plot-files/net.$devices[$x].rx.packet.size.plot plot-files/net.$devices[$x].tx.packet.size.plot";
+	push @{$plot_files{'arrays'}{'packet_size'}}, ("net.$devices[$x].rx.packet.size", "net.$devices[$x].tx.packet.size");
+
+	$plot_files{'drops'} .= " plot-files/net.$devices[$x].rx.drop.plot plot-files/net.$devices[$x].tx.drop.plot";
+	push @{$plot_files{'arrays'}{'drops'}}, ("net.$devices[$x].rx.drop", "net.$devices[$x].tx.drop");
+
+	if ($util) {
+	    $plot_files{'util'} .= " plot-files/net.$devices[$x].util.plot";
+	    push @{$plot_files{'arrays'}{'util'}}, "net.$devices[$x].util";
+	}
+    }
+
+    my $current_device = 0;
+    my $sar_start_sec = -1;
+    my $time_from_start;
+    my $prev_time;
+    my $time_add = 0;
+    my $field_modifier = 0;
+
+    if ($util) {
+	$field_modifier = 1;
+    }
+
+    while (<INPUT>) {
+	chomp($line = $_);
+
+	if ((length($line) == 0) || ($line =~ /Average:/) || (($mode == 1) && ($line =~ /IFACE.*rxpck\/s/))) {
+	    next;
+	}
+
+	if ($line =~ /IFACE.*rxpck\/s/) {
+	    $mode = 1;
+	    @fields = split(" ", $line);
+	    my ($ts, $am_pm) = @fields[0..1];
+	    if ($am_pm =~ /^am|pm$/i) {
+		$ts .= " $am_pm";
+	    }
+	    $sar_start_sec = time_in_seconds($ts);
+	    $prev_time = $sar_start_sec;
+	    next;
+	}
+
+	if ($line =~ /IFACE.*rxerr\/s/) {
+	    $mode = 2;
+	    $prev_time = $sar_start_sec;
+	    next;
+	}
+
+	if ($line =~ /call\/s/) {
+	    $mode = 0;
+	}
+
+	if ($line =~ /atmptf\/s/) {
+	    $mode = 3;
+	    $prev_time = $sar_start_sec;
+	    next;
+	}
+
+	if ($line =~ /idgm\/s/) {
+	    last;
+	}
+
+	if ($mode == 1) {
+	    @fields = ();
+	    @fields = split(" ", $line);
+	    my ($ts, $am_pm) = @fields[0..1];
+	    if ($am_pm =~ /^am|pm$/i) {
+		$ts .= " $am_pm";
+	    }
+	    $time_from_start = time_in_seconds($ts);
+	    if ($time_from_start < ($prev_time * .95)) {
+		$time_add += 24*60*60;
+	    }
+	    $prev_time = $time_from_start;
+	    $time_from_start += $time_add;
+
+	    $unit_modifier = 1;
+	    if ($unit_size eq "B") {
+		$unit_modifier = 1024;
+	    }
+
+	    print { $device_rx_file_handles[$current_device] } ($time_from_start - $sar_start_sec) . " " . ($fields[@fields - 5 - $field_modifier] / $unit_modifier) . "\n";
+	    print { $device_tx_file_handles[$current_device] } ($time_from_start - $sar_start_sec) . " " . ($fields[@fields - 4 - $field_modifier] / $unit_modifier) . "\n";
+
+	    print { $device_rx_bps_file_handles[$current_device] } ($time_from_start - $sar_start_sec) . " " . (convert_to_bps($fields[@fields - 5 - $field_modifier], $unit_size, 'Mb')) . "\n";
+	    print { $device_tx_bps_file_handles[$current_device] } ($time_from_start - $sar_start_sec) . " " . (convert_to_bps($fields[@fields - 4 - $field_modifier], $unit_size, 'Mb')) . "\n";
+
+	    print { $device_rx_packets_file_handles[$current_device] } ($time_from_start - $sar_start_sec) . " " . $fields[@fields - 7 - $field_modifier] . "\n";
+	    print { $device_tx_packets_file_handles[$current_device] } ($time_from_start - $sar_start_sec) . " " . $fields[@fields - 6 - $field_modifier] . "\n";
+
+	    if ($util) {
+		print { $device_util_file_handles[$current_device] } ($time_from_start - $sar_start_sec) . " " . $fields[@fields - 1] . "\n";
+	    }
+
+	    my $rx_packet_size;
+	    my $tx_packet_size;
+
+	    # multiply values by 1 for explicit conversion from string to float
+	    if ($fields[@fields - 5 -$field_modifier]*1 && $fields[@fields - 7 - $field_modifier]*1) {
+		$rx_packet_size = $fields[@fields - 5 - $field_modifier] / $fields[@fields - 7 - $field_modifier];
+	    } else {
+		$rx_packet_size = 0;
+	    }
+
+	    # multiply values by 1 for explicit conversion from string to float
+	    if ($fields[@fields - 4 - $field_modifier]*1 && $fields[@fields - 6 - $field_modifier]*1) {
+		$tx_packet_size = $fields[@fields - 4 - $field_modifier] / $fields[@fields - 6 - $field_modifier];
+	    } else {
+		$tx_packet_size = 0;
+	    }
+
+	    $unit_modifier = 1024;
+	    if ($unit_size eq "B") {
+		$unit_modifier = 1;
+	    }
+
+	    print { $device_rx_packet_size_file_handles[$current_device] } ($time_from_start - $sar_start_sec) . " " . ($rx_packet_size * $unit_modifier) . "\n";
+	    print { $device_tx_packet_size_file_handles[$current_device] } ($time_from_start - $sar_start_sec) . " " . ($tx_packet_size * $unit_modifier) . "\n";
+
+	    $current_device++;
+	    if ($current_device == @devices) {
+		$current_device = 0;
+	    }
+	}
+
+	if ($mode == 2) {
+	    @fields = ();
+	    @fields = split(" ", $line);
+	    my ($ts, $am_pm) = @fields[0..1];
+	    if ($am_pm =~ /^am|pm$/i) {
+		$ts .= " $am_pm";
+	    }
+	    $time_from_start = time_in_seconds($ts);
+	    if ($time_from_start < ($prev_time * .95)) {
+		$time_add += 24*60*60;
+	    }
+	    $prev_time = $time_from_start;
+	    $time_from_start += $time_add;
+
+	    print { $device_rx_drop_file_handles[$current_device] } ($time_from_start - $sar_start_sec) . " " . $fields[@fields - 6] . "\n";
+	    print { $device_tx_drop_file_handles[$current_device] } ($time_from_start - $sar_start_sec) . " " . $fields[@fields - 5] . "\n";
+
+	    $current_device++;
+	    if ($current_device == @devices) {
+		$current_device = 0;
+	    }
+	}
+
+	if ($mode == 3) {
+	    @fields = ();
+	    @fields = split(" ", $line);
+	    my ($ts, $am_pm) = @fields[0..1];
+	    if ($am_pm =~ /^am|pm$/i) {
+		$ts .= " $am_pm";
+	    }
+	    $time_from_start = time_in_seconds($ts);
+	    if ($time_from_start < ($prev_time * .95)) {
+		$time_add += 24*60*60;
+	    }
+	    $prev_time = $time_from_start;
+	    $time_from_start += $time_add;
+
+	    print { $retran_file_handle } ($time_from_start - $sar_start_sec) . " " . $fields[@fields - 3] . "\n";
+	}
+    }
+
+    for($x=0; $x<@devices; $x++) {
+	close $device_rx_file_handles[$x];
+	close $device_tx_file_handles[$x];
+	close $device_rx_bps_file_handles[$x];
+	close $device_tx_bps_file_handles[$x];
+	close $device_rx_packets_file_handles[$x];
+	close $device_tx_packets_file_handles[$x];
+	close $device_rx_packet_size_file_handles[$x];
+	close $device_tx_packet_size_file_handles[$x];
+	close $device_rx_drop_file_handles[$x];
+	close $device_tx_drop_file_handles[$x];
+	if ($util) {
+	    close $device_util_file_handles[$x];
+	}
+    }
+
+    close $retran_file_handle;
+
+    close INPUT;
+
+    return %plot_files;
+}
+
+sub process_cpu_data {
+    my $i;
+
+    my @input_files = `ls -1 $working_directory/$input_directory/sar.cpu_util_* 2> /dev/null | grep -v STDERR`;
+    chomp @input_files;
+    my $file;
+    my $cpu_number;
+    my $cpu_file_number;
+    my $mode = 0;
+    my $line;
+    my $total_cpu;
+    my $steal_presence;
+    my $guest_presence;
+    my $guest_nice_presence;
+
+    my %plot_files;
+    $plot_files{'list'} = "";
+    $plot_files{'array'} = ();
+
+    foreach $file (@input_files) {
+	my $num_physical_cpus = -1;
+
+	# handle the uniprocessor case where the data does not end up in the per cpu file, only in the overall file
+	if ((@input_files == 1) && ($file =~ /sar.cpu_util_0/)) {
+	    $file =~ s/cpu_util_0/cpu_util/;
+
+	    $cpu_number = 0;
+	    $cpu_file_number = prepend($cpu_number);
+	} else {
+	    $file =~ m/sar.cpu_util_([0-9]+)/;
+	    $cpu_number = $1;
+	    $cpu_file_number = prepend($cpu_number);
+	}
+
+	$num_physical_cpus = max($num_physical_cpus, $cpu_number);
+
+	if (!open(INPUT, "<$file")) {
+	    print STDERR "ERROR: Could not open $file\n";
+	    next;
+	}
+
+	$plot_files{'list'} .= " plot-files/cpu.$cpu_file_number.plot";
+	push @{$plot_files{'array'}}, "cpu.$cpu_file_number";
+	open FH, ">$output_directory/plot-files/cpu.$cpu_file_number.plot";
+	print FH "#LABEL:cpu $cpu_number\n";
+
+	$mode = 0;
+	my $sar_start_sec = -1;
+	my $time_from_start;
+	$steal_presence = 0;
+	$guest_presence = 0;
+	$guest_nice_presence = 0;
+	my $prev_time;
+	my $time_add = 0;
+
+	while (<INPUT>) {
+	    $line = $_;
+	    chomp($line);
+
+	    if (($line =~ /%system/) || ($line =~ /%sys/)) {
+		$mode = 1;
+		my @fields = split(" ", $line);
+		my ($ts, $am_pm) = @fields[0..1];
+		if ($am_pm =~ /^am|pm$/i) {
+		    $ts .= " $am_pm";
+		}
+		$sar_start_sec = time_in_seconds($ts);
+		$prev_time = $sar_start_sec;
+
+		if ($line =~ /%steal/) {
+		    $steal_presence = 1;
+		}
+
+		if ($line =~ /%guest/) {
+		    $guest_presence = 1;
+		}
+
+		if ($line =~ /%gnice/) {
+		    $guest_nice_presence = 1;
+		}
+
+		next;
+	    }
+
+	    if ($line =~ /Average/) {
+		$mode = 2;
+		last;
+	    }
+
+	    if (length($line) == 0) {
+		next;
+	    }
+
+	    if ($mode == 1) {
+		my ($ts, $am_pm) = split(" ", $line);
+		if ($am_pm =~ /^am|pm$/i) {
+		    $ts .= " $am_pm";
+		}
+
+		if (($steal_presence == 0) && ($guest_presence == 0) && ($guest_nice_presence == 0)) {
+		    $line =~ m/([0-9][0-9]:[0-9][0-9]:[0-9][0-9]) *([AaPp]*[Mm]*) *[a-zA-Z0-9]+ *([0-9\.]*) *([0-9\.]*) *([0-9\.]*) *([0-9\.]*) *([0-9\.]*)/;
+		    # $1 = timestamp, $2 - AM/PM, $3 = user, $4 = nice, $5 = system, $6 = iowait, $7 = idle
+		    #print "1=[$1] 2=[$2] 3=[$3] 4=[$4] 5=[$5] 6=[$6] 7=[$7]\n";
+		    $total_cpu = 100 - $7 - $6;
+		} elsif (($steal_presence == 1) && ($guest_presence == 0) && ($guest_nice_presence == 0)) {
+		    $line =~ m/([0-9][0-9]:[0-9][0-9]:[0-9][0-9]) *([AaPp]*[Mm]*) *[a-zA-Z0-9]+ *([0-9\.]*) *([0-9\.]*) *([0-9\.]*) *([0-9\.]*) *([0-9\.]*) *([0-9\.]*)/;
+		    #$line =~ m/[0-9][0-9]:[0-9][0-9]:[0-9][0-9] *[a-zA-Z0-9]+ *([0-9\.]*) *([0-9\.]*) *([0-9\.]*) *([0-9\.]*) *([0-9\.]*) *([0-9\.]*)/;
+		    # $1 = timestamp, $2 - AM/PM, $3 = user, $4 = nice, $5 = system, $6 = iowait, $7 = steal, $8 = idle
+		    #print "1=[$1] 2=[$2] 3=[$3] 4=[$4] 5=[$5] 6=[$6] 7=[$7] 8=[$8]\n";
+		    $total_cpu = 100 - $8 - $7 - $6;
+		} elsif (($steal_presence == 1) && ($guest_presence == 1) && ($guest_nice_presence == 0)) {
+		    $line =~ m/([0-9][0-9]:[0-9][0-9]:[0-9][0-9]) *([AaPp]*[Mm]*) *[a-zA-Z0-9]+ *([0-9\.]*) *([0-9\.]*) *([0-9\.]*) *([0-9\.]*) *([0-9\.]*) *([0-9\.]*) *([0-9\.]*) *([0-9\.]*) *([0-9\.]*)/;
+		    # $1 = timestamp, $2 - AM/PM, $3 = user, $4 = nice, $5 = system, $6 = iowait, $7 = steal, $8 = irq, $9 = softirq, $10 = guest, $11 = idle
+		    #print "1=[$1] 2=[$2] 3=[$3] 4=[$4] 5=[$5] 6=[$6] 7=[$7] 8=[$8] 9=[$9] 10=[$10] 11=[$11]\n";
+		    $total_cpu = 100.0 - $11 - $7 - $6;
+		} else {
+		    $line =~ m/([0-9][0-9]:[0-9][0-9]:[0-9][0-9]) *([AaPp]*[Mm]*) *[a-zA-Z0-9]+ *([0-9\.]*) *([0-9\.]*) *([0-9\.]*) *([0-9\.]*) *([0-9\.]*) *([0-9\.]*) *([0-9\.]*) *([0-9\.]*) *([0-9\.]*) *([0-9\.]*)/;
+		    # $1 = timestamp, $2 - AM/PM, $3 = user, $4 = nice, $5 = system, $6 = iowait, $7 = steal, $8 = irq, $9 = softirq, $10 = guest, $11 = gnice, $12 = idle
+		    #print "1=[$1] 2=[$2] 3=[$3] 4=[$4] 5=[$5] 6=[$6] 7=[$7] 8=[$8] 9=[$9] 10=[$10] 11=[$11] 12=[$12]\n";
+		    $total_cpu = 100.0 - $12 - $7 - $6;
+		}
+
+		$time_from_start = time_in_seconds($ts);
+		if ($time_from_start < ($prev_time * .95)) {
+		    $time_add += 24*60*60;
+		}
+		$prev_time = $time_from_start;
+		$time_from_start += $time_add;
+
+		print FH ($time_from_start - $sar_start_sec) . " $total_cpu\n";
+	    }
+	}
+
+	close INPUT;
+	close FH;
+    }
+
+    return %plot_files;
+}
+
+sub process_paging_data {
+    if (!open(INPUT, "<$working_directory/$input_directory/sar.paging_stats")) {
+	print STDERR "ERROR: Could not open sar.paging_stats.\n";
+	return;
+    }
+
+    my $line;
+    my $mode = 0;
+
+    my @fields;
+    my $sar_start_sec = -1;
+    my $time_from_start;
+    my $prev_time;
+    my $time_add = 0;
+
+    open(PAGED_IN, ">$output_directory/plot-files/paged-in.plot");
+    open(PAGED_OUT, ">$output_directory/plot-files/paged-out.plot");
+    open(MINOR_FLT, ">$output_directory/plot-files/minor-faults.plot");
+    open(MAJOR_FLT, ">$output_directory/plot-files/major-faults.plot");
+    open(KSWAPD_PAGE_SCANS, ">$output_directory/plot-files/kswapd-page-scans.plot");
+    open(DIRECT_PAGE_SCANS, ">$output_directory/plot-files/direct-page-scans.plot");
+    open(RECLAIMED_PAGES, ">$output_directory/plot-files/reclaimed-pages.plot");
+    open(VM_EFFICIENCY, ">$output_directory/plot-files/vm-efficiency.plot");
+
+    print PAGED_IN "#LABEL:Paged In From Disk\n";
+    print PAGED_OUT "#LABEL:Paged Out To Disk\n";
+    print MINOR_FLT "#LABEL:Minor Faults\n";
+    print MAJOR_FLT "#LABEL:Major Faults\n";
+    print KSWAPD_PAGE_SCANS "#LABEL:kwapd Pages Scanned\n";
+    print DIRECT_PAGE_SCANS "#LABEL:Pages Scanned Directly\n";
+    print RECLAIMED_PAGES "#LABEL:Pages Reclaimed from Cache\n";
+    print VM_EFFICIENCY "#LABEL:Efficiency of Page Reclaim\n";
+
+    while (<INPUT>) {
+	chomp($line = $_);
+
+	if ($line =~ /pgpgin\/s/) {
+	    $mode = 1;
+	    @fields = split(" ", $line);
+	    my ($ts, $am_pm) = @fields[0..1];
+	    if ($am_pm =~ /^am|pm$/i) {
+		$ts .= " $am_pm";
+	    }
+	    $sar_start_sec = time_in_seconds($ts);
+	    $prev_time = $sar_start_sec;
+	    next;
+	}
+
+	if ($line =~ /Average/) {
+	    last;
+	}
+
+	if ($mode == 1) {
+	    @fields = split(" ", $line);
+	    my ($ts, $am_pm) = @fields[0..1];
+	    if ($am_pm =~ /^am|pm$/i) {
+		$ts .= " $am_pm";
+	    }
+	    $time_from_start = time_in_seconds($ts);
+	    if ($time_from_start < ($prev_time * .95)) {
+		$time_add += 24*60*60;
+	    }
+	    $prev_time = $time_from_start;
+	    $time_from_start += $time_add;
+
+	    print PAGED_IN ($time_from_start - $sar_start_sec) . " $fields[@fields - 9]\n";
+	    print PAGED_OUT ($time_from_start - $sar_start_sec) . " $fields[@fields - 8]\n";
+	    print MINOR_FLT ($time_from_start - $sar_start_sec) . " " . ($fields[@fields - 7] - $fields[@fields - 6]) . "\n";
+	    print MAJOR_FLT ($time_from_start - $sar_start_sec) . " $fields[@fields - 6]\n";
+	    print KSWAPD_PAGE_SCANS ($time_from_start - $sar_start_sec) . " $fields[@fields - 4]\n";
+	    print DIRECT_PAGE_SCANS ($time_from_start - $sar_start_sec) . " $fields[@fields - 3]\n";
+	    print RECLAIMED_PAGES ($time_from_start - $sar_start_sec) . " $fields[@fields - 2]\n";
+
+	    if (int($fields[@fields - 4]) || int($fields[@fields - 3]) || int($fields[@fields - 1])) {
+		print VM_EFFICIENCY ($time_from_start - $sar_start_sec) . " $fields[@fields - 1]\n";
+	    }
+	}
+    }
+
+    close INPUT;
+    close PAGED_IN;
+    close PAGED_OUT;
+    close MINOR_FLT;
+    close MAJOR_FLT;
+    close KSWAPD_PAGE_SCANS;
+    close DIRECT_PAGE_SCANS;
+    close RECLAIMED_PAGES;
+    close VM_EFFICIENCY;
+}
+
+sub convert_to_bps($$$) {
+    my $in    = shift;
+    my $ibase = shift;
+    my $obase = shift;
+
+    my @bytes = ('B', 'KB', 'MB', 'GB');
+    my @bits  = ('b', 'Kb', 'Mb', 'Gb');
+
+    my $i_idx = 0;
+    foreach my $i (1 .. @bytes) {
+	$i_idx = $i if ($bytes[$i-1] eq $ibase);
+    }
+
+    my $o_idx = 0;
+    foreach my $i (1 .. @bits) {
+	$o_idx = $i if ($bits[$i-1] eq $obase);
+    }
+
+    my $out = $in;
+    if ($i_idx && $o_idx) {
+	if ($i_idx < $o_idx) {
+	    $out /= 1024 foreach (1 .. ($o_idx - $i_idx));
+	} elsif ($i_idx > $o_idx) {
+	    $out *= 1024 foreach (1 .. ($i_idx - $o_idx));
+	}
+	$out *= 8;
+    } else {
+	print STDERR "ERROR: Invalid arguments supplied for converting byte [$ibase] to bit [$obase] rate\n";
+	$out = 0;
+    }
+
+    return $out;
+}

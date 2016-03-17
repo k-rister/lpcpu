@@ -1,0 +1,313 @@
+Linux Performance Customer Profiler Utility
+
+1. Overview
+2. Running LPCPU
+3. Postprocesssing the data
+4. Viewing the results
+
+
+1. Overview
+===========
+
+The Linux Performance Customer Profiler Utility (LPCPU) is a utility that
+integrates system configuration data collection, performance profiling data
+collection, profiler data post processing, and graphing into a single package.
+LPCPU relies on profiling utilities that are standard components of both
+enterprise and community based distributions.  In addition to these dependencies
+LPCPU bundles additional tools for processing the data and generating graphs.
+
+
+2. Running LPCPU
+================
+
+To run LPCPU, execute the lpcpu.sh script that is located in the top level
+directory of the LPCPU distribution tarball (where this README is located).
+The lpcpu.sh script takes several arguments, for an all inclusive list please
+see the script header comments.  Ideally the script should be executed with root
+privileges since many of the data collection steps it performs require the
+elevated privileges of root.
+
+Here is an example invocation which collects data for 60 seconds (the default
+period is 120 seconds).  This example expects that the workload of interest is
+already running on the system and the desire is to collect data from a 60 second
+window while the workload executes:
+
+================================================================================
+root@host ~ $ ./lpcpu/lpcpu.sh duration=60
+Running Linux Performance Customer Profiler Utility version c7947e57eacca5b3ed3481d19d68a486accffff8 2013-11-12 14:04:11 -0600
+Importing CLI variable : duration=60
+
+Starting Time: Tue Nov 12 15:37:57 CST 2013
+Setting up sar.
+Setting up iostat.
+Setting up mpstat.
+Setting up vmstat.
+Setting up top.
+Setting up meminfo.
+Setting up proc-interrupts.
+Profilers start at: Tue Nov 12 15:37:57 CST 2013
+starting sar.default [5]
+starting iostat.default [5] [mode=disks]
+starting mpstat.default [5]
+starting vmstat.default [5]
+Starting top.
+starting meminfo.default [5]
+starting proc-interrupts.default [5]
+Waiting for 60 seconds.
+Stopping sar.
+Stopping iostat.
+Stopping mpstat.
+Stopping vmstat.
+Stopping top.
+Stopping meminfo.
+Stopping interrupts.
+Profilers stop at: Tue Nov 12 15:38:57 CST 2013
+Processing sar data.
+Processing iostat data.
+Processing mpstat data.
+Processing vmstat data.
+Processing top data.
+Processing meminfo data.
+Processing interrupts data.
+Setting up postprocess.sh
+Gathering system information
+Finishing time: Tue Nov 12 15:39:09 CST 2013
+Packaging data...data collected is in /tmp/lpcpu_data.host.default.2013-11-12_1537.tar.bz2
+================================================================================
+
+As the output reports at the end, the resulting data file is located in the
+/tmp directory.  An alternative use case for LPCPU is to use it to profile the
+entire lifecycle of a program.  In order to use it in this fashion, invoke the
+script using the following syntax:
+
+  ./lpcpu.sh cmd="<command to run with arguments>"
+
+For example:
+
+  ./lpcpu.sh cmd="dd if=/dev/zero of=/dev/null bs=1M count=1024"
+
+Another useful command line parameter is available to invoke additional 
+profiling tools that are not included in the default list of tools to run.
+These tools are not included in the default list because they either have
+special requirements, high overhead, or are specific to certain environments.
+
+In order to invoke these tools use the following syntax:
+
+  ./lpcpu.sh extra_profilers="<list of profilers>"
+
+For example:
+
+  ./lpcpu.sh extra_profilers="oprofile"
+
+    or
+
+  ./lpcpu.sh extra_profilers="perf"
+
+    or
+
+  ./lpcpu.sh extra_profilers="kvm"
+
+    or
+
+  ./lpcpu.sh extra_profilers="ftrace"
+
+    or
+
+  ./lpcpu.sh extra_profilers="tcpdump"
+
+Multiple non-default profilers can be specified using a quoted list.
+
+For example:
+
+  ./lpcpu.sh extra_profilers="perf kvm"
+
+For a complete list of the non-default profilers please see the lpcpu.sh script.
+NOTE: oprofile and perf are mutually exclusive.
+
+
+3. Postprocesssing the data
+===========================
+
+In order to complete the data collection a script, postprocess.sh. must be
+executed from within the directory structure created by the lpcpu.sh script.
+This step is left to the user so that it can be carried out after testing is
+complete or even on a different system if desired.
+
+The postprocess.sh script takes a single required argument which is the location
+of the LPCPU distribution directory.  The script requires the location of the
+LPCPU distribution directory so that it can find utilities required to complete
+the post processing and graphing of the data.
+
+================================================================================
+root@host:/tmp$ tar xjf lpcpu_data.host.default.2013-11-12_1537.tar.bz2
+
+root@host:/tmp$ cd lpcpu_data.host.default.2013-11-12_1537/
+
+root@host /tmp/lpcpu_data.host.default.2013-11-12_1537 $ ./postprocess.sh ~/lpcpu
+Processing Directory : sar.breakout.default.001
+ERROR: Could not open sar.pwr_mgmt.  WARNING: This data may not exist in your version of sar.
+Loaded block device hierarchy data from block-device-hierarchy.dat
+Processing File : iostat.default.001
+Discovered iostat_type=[disks]
+Processing File : mpstat.default.001
+Using guest mode
+postprocess-mpstat: Loading topology archive from ./system-topology.dump
+Processing File : vmstat.default.001
+Discovered vmstat_interval=[5]
+Processing File : meminfo-watch.default.001
+Processing File : proc-interrupts.default.001
+postprocess-proc-interrupts: Loading topology archive from ./system-topology.dump
+    MANAGER : Jobs:             16
+    MANAGER : Parallel Threads: 16
+    MANAGER : Starting threads: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+    MANAGER : 2013-11-12 15:40:43 : There are 16 jobs waiting in the queue
+        WORKER : thread=[15] starting
+        WORKER : 2013-11-12 15:40:43 : thread=[15] retrieved job=[0]
+        WORKER : thread=[7] starting
+        WORKER : thread=[10] starting
+        WORKER : 2013-11-12 15:40:43 : thread=[7] retrieved job=[1]
+        WORKER : 2013-11-12 15:40:43 : thread=[10] retrieved job=[2]
+        WORKER : thread=[12] starting
+        WORKER : 2013-11-12 15:40:43 : thread=[12] retrieved job=[3]
+        WORKER : thread=[6] starting
+        WORKER : 2013-11-12 15:40:43 : thread=[6] retrieved job=[4]
+        WORKER : thread=[3] starting
+        WORKER : 2013-11-12 15:40:43 : thread=[3] retrieved job=[5]
+        WORKER : thread=[4] starting
+        WORKER : thread=[0] starting
+        WORKER : 2013-11-12 15:40:43 : thread=[4] retrieved job=[6]
+        WORKER : thread=[5] starting
+        WORKER : 2013-11-12 15:40:43 : thread=[0] retrieved job=[7]
+        WORKER : 2013-11-12 15:40:43 : thread=[5] retrieved job=[8]
+        WORKER : thread=[2] starting
+        WORKER : thread=[1] starting
+        WORKER : thread=[14] starting
+        WORKER : thread=[8] starting
+        WORKER : 2013-11-12 15:40:43 : thread=[8] retrieved job=[12]
+        WORKER : 2013-11-12 15:40:43 : thread=[1] retrieved job=[10]
+        WORKER : 2013-11-12 15:40:43 : thread=[14] retrieved job=[11]
+        WORKER : thread=[13] starting
+        WORKER : thread=[9] starting
+        WORKER : 2013-11-12 15:40:43 : thread=[2] retrieved job=[9]
+        WORKER : thread=[11] starting
+        WORKER : 2013-11-12 15:40:43 : thread=[13] retrieved job=[13]
+        WORKER : 2013-11-12 15:40:43 : thread=[9] retrieved job=[14]
+        WORKER : 2013-11-12 15:40:43 : thread=[11] retrieved job=[15]
+    MANAGER : 2013-11-12 15:40:44 : Signaling worker threads that all jobs are consumed
+        WORKER : 2013-11-12 15:40:45 : thread=[13] finished after processing 1 job(s)
+        WORKER : 2013-11-12 15:40:46 : thread=[5] finished after processing 1 job(s)
+        WORKER : 2013-11-12 15:40:46 : thread=[10] finished after processing 1 job(s)
+        WORKER : 2013-11-12 15:40:46 : thread=[7] finished after processing 1 job(s)
+        WORKER : 2013-11-12 15:40:46 : thread=[2] finished after processing 1 job(s)
+        WORKER : 2013-11-12 15:40:46 : thread=[3] finished after processing 1 job(s)
+        WORKER : 2013-11-12 15:40:47 : thread=[4] finished after processing 1 job(s)
+        WORKER : 2013-11-12 15:40:47 : thread=[12] finished after processing 1 job(s)
+        WORKER : 2013-11-12 15:40:47 : thread=[1] finished after processing 1 job(s)
+        WORKER : 2013-11-12 15:40:47 : thread=[6] finished after processing 1 job(s)
+        WORKER : 2013-11-12 15:40:47 : thread=[0] finished after processing 1 job(s)
+        WORKER : 2013-11-12 15:40:47 : thread=[11] finished after processing 1 job(s)
+        WORKER : 2013-11-12 15:40:47 : thread=[9] finished after processing 1 job(s)
+        WORKER : 2013-11-12 15:40:47 : thread=[15] finished after processing 1 job(s)
+    MANAGER : 2013-11-12 15:40:48 : There are 2 threads still processing jobs
+    MANAGER : 2013-11-12 15:40:53 : There are 2 threads still processing jobs
+        WORKER : 2013-11-12 15:40:58 : thread=[8] finished after processing 1 job(s)
+    MANAGER : 2013-11-12 15:40:58 : There are 1 threads still processing jobs
+        WORKER : 2013-11-12 15:41:00 : thread=[14] finished after processing 1 job(s)
+Scalars leaked: 1
+Scalars leaked: 1
+Scalars leaked: 1
+Scalars leaked: 1
+Scalars leaked: 1
+Scalars leaked: 1
+Scalars leaked: 1
+Scalars leaked: 1
+Scalars leaked: 1
+Scalars leaked: 1
+Scalars leaked: 1
+Scalars leaked: 1
+Scalars leaked: 1
+Scalars leaked: 1
+Scalars leaked: 1
+Scalars leaked: 1
+    MANAGER : Queue processing took 17 second(s)
+Scalars leaked: 1
+================================================================================
+
+When the postprocess.sh script is executed it is possible that some errors may
+occur.  They are not necessarily fatal.  Some environments are lacking certain
+tools or versions of tools that may be used for parts of the data collection.
+In that event there will be a small impact to the available data but overall
+there should be plenty of usable information.
+
+
+4. Viewing the results
+======================
+
+The postprocess.sh script also has a second, optional argument that is used to
+force the use of an older charting technique (known as chart.pl).  The charting
+capabilities in LPCPU have recently been updated to produce dynamic charts using
+Javascript with a new technique called jschart.  These charts require a "modern"
+browser (Firefox/Internet Explorer/Chrome/Safari) and potentially could have
+functional/performance issues in some environments (older browsers, extremely
+large datasets, etc.) so the ability to force LPCPU to generate the older style
+of charts is provided.  To do so, invoke postprocess.sh in the following way:
+
+  ./postprocess.sh <path to lpcpu> chart.pl
+
+For example:
+
+  ./postprocess.sh ~/lpcpu chart.pl
+
+When the processing phase is complete, the directory will contain a summary.html
+file that can be loaded into a browser to assist in navigating the profiled
+data.
+
+Due to security considerations, some browsers will not allow the jschart code to
+load the chart data files when run "locally" (i.e., without a web server
+delivering the files to the browser).  In the environments that this has been
+tested on, Chrome and Internet Explorer have this restriction while Firefox does
+not.  For browsers that enforce this behavior, the data collected by LPCPU must
+be served by a web server in order to view the dynamic charts that jschart
+provides.  You can either use your own web server (any will do), or a small
+Python script (results-web-server.py) is included in the results package.  This
+script will launch a small web server for local access and is easily stopped
+with a CTRL-C when you are done.  Here is an example of the lifecycle of that
+script:
+
+================================================================================
+user@host: /tmp/lpcpu_data$ ./results-web-server.py
+Using your browser, open http://127.0.0.1:8080/summary.html to view profiler data charts or http://127.0.0.1:8080 to browse all collected data.
+Press CTRL-C to quit...
+^C
+SIGINT received: Stopping web server...
+Shutdown complete
+Goodbye!
+user@host: /tmp/lpcpu_data$
+================================================================================
+
+The new jschart functionality requires the use of a two different third party
+libraries.  By default, the pages that are generated by the postprocess.sh
+script will instruct the browser to load those libraries from the Internet, so
+you will need to have Internet access when viewing the data.  If you need to be
+able to access the charts without Internet access, you can download the
+libraries into your LPCPU distribution by executing the following script:
+
+  ./download-jschart-dependencies.sh
+
+Executing this script will download the libraries and place them into the LPCPU
+distribution.  It will then use those libraries when generating the data so no
+Internet access will be required.  If you wish to host your data for viewing on
+an SSL secured web server (HTTPS), you may be forced to use this ability to host
+the libraries locally, because some browsers will not load external resources
+when in a secured browser session.
+
+Using jschart has several advantages over chart.pl that should make using LPCPU
+for performance analysis easier.  First, unlike chart.pl (which will only run on
+an x86 Linux box), jschart has no architectural dependency issues.  Second,
+jschart defers the generation of the charts to the web browser client, so
+executing postprocess.sh should be noticeably faster than before.  This does
+place some requirements on the client, such as the use of a modern browser, but
+it also brings several additional advantages.  The charts are now dynamic, with
+the user having the ability to pan and/or zoom the charting area and selecting a
+specific dataset to focus on.  Click the "Help" link on a chart for additional
+details.

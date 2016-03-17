@@ -1,0 +1,194 @@
+#!/usr/bin/perl
+
+#
+# LPCPU (Linux Performance Customer Profiler Utility): ./postprocess/postprocess-ksm
+#
+# (C) Copyright IBM Corp. 2016
+#
+# This file is subject to the terms and conditions of the Eclipse
+# Public License.  See the file LICENSE.TXT in the main directory of the
+# distribution for more details.
+#
+
+
+# postprocess the ksm profiler data
+
+use strict;
+#use Data::Dumper;
+use autobench::strings;
+use autobench::jschart;
+
+if (@ARGV < 1) {
+    print STDERR "postprocess-ksm: No working directory specified\n";
+    exit 1;
+}
+
+if (@ARGV < 2) {
+    print STDERR "postprocess-ksm: No identifier specified\n";
+    exit 1;
+}
+
+if (@ARGV < 3) {
+    print STDERR "postprocess-ksm: No invocation id specified\n";
+    exit 1;
+}
+
+my $working_directory = $ARGV[0];
+my $identifier = $ARGV[1];
+my $invocation_id = $ARGV[2];
+
+my $input_file = "ksm." . $invocation_id . "." . $identifier;
+
+print "Processing File : $input_file\n";
+
+if (!open(INPUT,"<$working_directory/$input_file")) {
+    print STDERR "postprocess-ksm: could not open specified input file\n";
+    exit 1;
+}
+
+my $output_directory = "$working_directory/ksm-processed.$invocation_id.$identifier";
+mkdir $output_directory;
+mkdir "$output_directory/plot-files";
+
+my $mode = 0;
+my @header;
+my @data;
+
+while (<INPUT>) {
+    chomp ($_);
+
+    if ($mode < 1) {
+	if ($_ =~ /^date/) {
+	    @header = split(/\s+\|\s+/, $_);
+	    $mode++;
+	}
+    } elsif ($mode < 2) {
+	$mode++;
+    } else {
+	my @fields = split(/\s+\|\s+/, $_);
+	push @data, \@fields;
+    }
+}
+
+close INPUT;
+
+#print Dumper \@header;
+#print Dumper \@data;
+
+# field number for the first non label (timestamp, date) field
+my $starting_header_entry = 2;
+
+# field number for the timestamp (epoch)
+my $header_timestamp = 1;
+
+# fields which are running totals and need the delta from the previous value to be calculated
+my %delta_fields = ( 2 => 0 );
+
+for (my $i=$starting_header_entry; $i<@header; $i++) {
+    if (open(OUTPUT, ">$output_directory/plot-files/" . $header[$i] . ".plot")) {
+	print OUTPUT "#LABEL:" . $header[$i] . "\n";
+
+	# start at index 1 for reference to previous record
+	for (my $x=1; $x<@data; $x++) {
+	    print OUTPUT ($data[$x][$header_timestamp] - $data[0][$header_timestamp]) . " ";
+
+	    if (exists $delta_fields{$i}) {
+		print OUTPUT ( ($data[$x][$i] - $data[$x-1][$i]) / ($data[$x][$header_timestamp] - $data[$x-1][$header_timestamp]) );
+	    } else {
+		print OUTPUT $data[$x][$i];
+	    }
+
+	    print OUTPUT "\n";
+	}
+
+	close OUTPUT;
+    } else {
+	print STDERR "ERROR: Could not open $output_directory/plot-files/" . $header[$i] . ".plot\n";
+    }
+}
+
+if (! $ENV{'FORCE_CHART_PL'}) {
+    my $chart_page = new autobench::jschart("KSM Charts");
+    if ($ENV{'FORCE_JSCHART_REMOTE_LIBRARY'}) {
+	$chart_page->set_library_remote;
+    }
+
+    $chart_page->enable_raw_data_file_links('../');
+
+    $chart_page->add_chart('ksm_pages', 'line', 'KSM Pages', 'Time (secs.)', '# Pages');
+    $chart_page->add_plots('ksm_pages', ('pages_shared', 'pages_sharing', 'pages_unshared', 'pages_volatile'));
+    $chart_page->add_legend_entries('ksm_pages', ('pages_shared = Number of shared kernel pages in use',
+						  'pages_sharing = Number of pages saved by KSM',
+						  'pages_unshared = Number of unique pages repeatedly checked for merging',
+						  'pages_volatile = Number of pages changing to fast to be analyzed'));
+    $chart_page->add_raw_data_sources('ksm_pages', $input_file);
+
+    $chart_page->add_chart('ksm_state', 'line', 'KSM State', 'Time (secs.)', '1=On / 0=Off');
+    $chart_page->add_plots('ksm_state', 'run');
+    $chart_page->add_raw_data_sources('ksm_state', $input_file);
+
+    $chart_page->add_chart('ksm_sleep', 'line', 'KSM Sleep', 'Time (secs.)', 'Milliseconds');
+    $chart_page->add_plots('ksm_sleep', 'sleep_millisecs');
+    $chart_page->add_raw_data_sources('ksm_sleep', $input_file);
+
+    $chart_page->add_chart('ksm_page_scanning', 'line', 'KSM Page Scanning', 'Time (secs.)', '# Pages per Scan');
+    $chart_page->add_plots('ksm_page_scanning', 'pages_to_scan');
+    $chart_page->add_raw_data_sources('ksm_page_scanning', $input_file);
+
+    $chart_page->add_chart('ksm_full_scans', 'line', 'KSM Full Scans', 'Time (secs.)', '# of Scans per Seecond');
+    $chart_page->add_plots('ksm_full_scans', 'full_scans');
+    $chart_page->add_raw_data_sources('ksm_full_scans', $input_file);
+
+    if (!open(CHART_HTML, ">$output_directory/chart.html")) {
+	print STDERR "postprocess-ksm: Could not create chart.html file\n";
+	exit 1;
+    } else {
+	chmod (0644, "$output_directory/chart.html");
+
+	print CHART_HTML $chart_page->dump_page;
+
+	close CHART_HTML;
+    }
+} else {
+    if (!open(CHART_SCRIPT, ">$output_directory/chart.sh")) {
+	print STDERR "postprocess-ksm: Could not create chart.sh file\n";
+	exit 1;
+    } else {
+	chmod (0777, "$output_directory/chart.sh");
+
+	print CHART_SCRIPT "#!/bin/bash\n\n";
+	print CHART_SCRIPT 'DIR=`dirname $0`' . "\n\n";
+	print CHART_SCRIPT 'if [ $# != 2 ]; then' . "\n";
+	print CHART_SCRIPT '  echo "You must specify the path to the chart.pl script and the Chart Directory libraries."' . "\n";
+	print CHART_SCRIPT '  exit 1' . "\n";
+	print CHART_SCRIPT 'fi' . "\n\n";
+	print CHART_SCRIPT 'SCRIPT=$1' . "\n";
+	print CHART_SCRIPT 'LIBRARIES=$2' . "\n\n";
+	print CHART_SCRIPT 'export PERL5LIB=$LIBRARIES' . "\n\n";
+	print CHART_SCRIPT 'pushd $DIR > /dev/null' . "\n\n";
+
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "1 KSM Pages" -x "Time (secs.)" -y "# Pages" --legend-entry "pages_shared = Number of shared kernel pages in use" --legend-entry "pages_sharing = Number of pages saved by KSM" --legend-entry "pages_unshared = Number of unique pages repeatedly checked for merging" --legend-entry "pages_volatile = Number of pages changing to fast to be analyzed" plot-files/pages_shared.plot plot-files/pages_sharing.plot plot-files/pages_unshared.plot plot-files/pages_volatile.plot' . "\n\n";
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "2 KSM State" -x "Time (secs.)" -y "1=On / 0=Off" plot-files/run.plot' . "\n\n";
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "3 KSM Sleep" -x "Time (secs.)" -y "Milliseconds" plot-files/sleep_millisecs.plot' . "\n\n";
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "4 KSM Page Scanning" -x "Time (secs.)" -y "# Pages per Scan" plot-files/pages_to_scan.plot' . "\n\n";
+	print CHART_SCRIPT '$SCRIPT --table html -s lines --title "5 KSM Full Scans" -x "Time (secs.)" -y "# of Scans per Second" plot-files/full_scans.plot' . "\n\n";
+
+	print CHART_SCRIPT 'echo -e "<html>\n<head>\n<title>KSM Charts</title>\n</head>\n<body>\n" > chart.html' . "\n";
+
+	print CHART_SCRIPT 'for i in `ls -1 *.png`; do' . "\n";
+	print CHART_SCRIPT '  echo -e "<table>\n<tr valign=\'top\'>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  echo -e "<td><img src=\'$i\'></td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  html_file=`echo $i | sed -e "s/png/html/"`' . "\n";
+	print CHART_SCRIPT '  if [ -e $html_file ]; then' . "\n";
+	print CHART_SCRIPT '    echo -e "<td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '    cat $html_file >> chart.html' . "\n";
+	print CHART_SCRIPT '    echo -e "</td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  fi' . "\n";
+	print CHART_SCRIPT '  echo -e "</tr>\n</table>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT 'done' . "\n\n";
+
+	print CHART_SCRIPT 'echo -e "</body>\n</html>\n" >> chart.html' . "\n";
+
+	close CHART_SCRIPT;
+    }
+}

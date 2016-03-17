@@ -1,0 +1,378 @@
+#! /bin/bash
+
+#
+# LPCPU (Linux Performance Customer Profiler Utility): ./tools/kvm-stat
+#
+# (C) Copyright IBM Corp. 2016
+#
+# This file is subject to the terms and conditions of the Eclipse
+# Public License.  See the file LICENSE.TXT in the main directory of the
+# distribution for more details.
+#
+
+
+# New and improved replacement for kvm_stat
+#
+# Parameters that are backward compatible with kvm_stat
+# optparam:  -1, --once, --batch
+#	These options do nothing.  The default mode for this script is
+#	once/batch.  These options are here for backward compatibility with
+#	kvm_stat.
+# optparam:  -l, --log
+#	Display output in log mode, a continuously running display with the
+#	value of each statistic in its own column.  Log mode is not the default.
+#	Samples are taken every	"interval".  The default interval is one second.
+# optparam:  -f <regex>, --fields <regex>, --fields=<regex>
+#	Filter which statistics get displayed using the regex.
+#
+# New autobench style parameters
+# optparam:  log=<yes|no>
+#	Same as -l above.
+# optparam:  fields=<regex>
+#	Same as -f above.
+# optparam:  interval=<n>
+#	Time in seconds between samples of the statistics.  Default is 1.
+#	If you use an interval other than one second, make sure your
+#	postprocessor can handle it.  Using time stamps in your output may help
+#	your postprocessor handle intervals other than one second.
+# optparam:
+#	timestamps=<yes|no>
+#	Whether to display time stamps in the log mode output.  Default is no.
+#	If you use time stamps, make sure your postprocessor can handle them.
+#
+# This script does most of what the kvm_stat script does (this script doesn't
+# have a curses mode), and improves on it in several ways.
+#
+# 1) It doesn't truncate the column header names.  The column names are actually
+# the file names in the /sys/kernel/debug/kvm/ directory.  When kvm_stat
+# truncates the column names it ends up producing duplicate column names so you
+# don't know which column is which.  And truncated names can be confusing.  For
+# example, "mmu_cache" only gives a vague indication that the statistic has
+# something to do with the mmu cache, whereas the real name. mmu_cache_miss,
+# tells you specifically what is being measured.
+#
+# 2) It doesn't assume that debugfs is mounted on /sys/kernel/debug.  debugfs
+# can be mounted anywhere.  The script also doesn't assume that if
+# /sys/kernel/debug doesn't exist that it means that your kernel was not
+# compiled with CONFIG_DEBUG_FS, as kvm_stat does.
+#
+# 3) If debugfs is not mounted, instead of bailing out with a message that tells
+# you the mount command to run, this script will attempt the mount command for
+# you.  And on exit it will undo whatever it did to mount debugfs.
+#
+# 4) When running in log mode this script prints out the column headers based on
+# the number of rows on the display instead of the fixed amount of twenty lines.
+#
+# 5) It allows you to set the interval to something other than one second.
+#
+# 6) It allows you to add time stamps to the log mode output.
+#
+# 7) It's not written in Python.  Python is ugly, and it is overkill for a
+# script that merely reads and displays file contents.
+#
+# kvm_stat defaults to its curses mode.  This script doesn't have a curses mode,
+# so its default is the "once" mode.
+
+SCRIPT_NAME=${0##*/}
+
+function echo_error {
+	echo "$*" >&2
+}
+
+# Parse the parameters.
+
+while [ -n "$1" ]; do
+	case $1 in
+		# Be backwards compatible with the kvm_stat parameters.
+		-l|--log)
+			log='yes'
+		;;
+		-1|--once|--batch)
+			log='no'
+		;;
+		-f|--fields)
+			shift
+			fields="$1"
+		;;
+		--fields=*)
+			fields="${1#--fields=}"
+		;;
+
+		# Handle autobench style key=value parameters.
+		*=*)
+			export "$1"
+		;;
+
+		*)
+			echo_error "$SCRIPT_NAME: \"$1\" is not a valid option.  It is ignored."
+		;;
+	esac
+	shift
+done
+
+log=${log:-'no'}
+fields=${fields:-''}
+interval=${interval:-1}
+timestamps=${timestamps:-'no'}
+
+# function check_debugfs_kernel_config
+#
+# Check if the kernel is configured for debugfs.
+function check_debugfs_kernel_config {
+        CONFIG="/boot/config-`uname -r`"
+        if [ -e $CONFIG ]; then
+                if ! grep "CONFIG_DEBUG_FS=" $CONFIG; then
+                        echo_error "$SCRIPT_NAME: Your kernel is not configured for debugfs."
+                fi
+        else
+                CONFIG="/lib/modules/`uname -r`/build/.config"
+                if [ -e $CONFIG ]; then
+                        if ! grep "CONFIG_DEBUG_FS=" $CONFIG; then
+                                echo_error "$SCRIPT_NAME: Your kernel is not configured for debugfs."
+                        fi
+                fi
+        fi
+}
+
+NEED_DEBUGFS_MOUNT=no
+NEED_DEBUGFS_DIR=no
+
+DEBUGFS_ROOT=`grep debugfs /proc/mounts | awk '{print $2}'`
+if [ -z "$DEBUGFS_ROOT" ]; then
+        NEED_DEBUGFS_MOUNT=yes
+
+        SYSFS_ROOT=`grep ^sysfs /proc/mounts | awk '{print $2}'`
+        if [ -n "$SYSFS_ROOT" ]; then
+                DEBUGFS_ROOT=$SYSFS_ROOT/kernel
+        fi
+        # Note that if sysfs is not mounted, this script will end up using
+        # /debug as the mount directory for debugfs.
+        DEBUGFS_ROOT=$DEBUGFS_ROOT/debug
+
+        if [ ! -d $DEBUGFS_ROOT ]; then
+                NEED_DEBUGFS_DIR=yes
+                mkdir -p $DEBUGFS_ROOT
+        fi
+
+        mount -t debugfs debugfs $DEBUGFS_ROOT
+        RET=$?
+        if [ $RET -ne 0 ]; then
+                echo_error "$SCRIPT_NAME: Unable to mount debugfs."
+                check_debugfs_kernel_config
+                if [ "$NEED_DEBUGFS_DIR" == "yes" ]; then
+                        rmdir $DEBUGFS_ROOT
+                fi
+                exit $RET
+        fi
+fi
+
+# function debugfs_restore
+#
+# Restore anything we did to get debugfs mounted.
+function debugfs_restore {
+        if [ "$NEED_DEBUGFS_MOUNT" == "yes" ]; then
+                umount $DEBUGFS_ROOT
+        fi
+        if [ "$NEED_DEBUGFS_DIR" == "yes" ]; then
+                rmdir $DEBUGFS_ROOT
+        fi
+	exit
+}
+
+# Restore the debugfs state when the script exits.
+trap "debugfs_restore; exit" SIGINT SIGQUIT SIGABRT SIGTERM
+
+KVM_STAT_DIR="$DEBUGFS_ROOT/kvm"
+if ! [ -e $KVM_STAT_DIR ]; then
+	echo_error "$SCRIPT_NAME: There are no KVM statistics available."
+	if ! lsmod | grep -q kvm; then
+		echo_error "$SCRIPT_NAME: The KVM kernel modules are not loaded."
+	fi
+	debugfs_restore
+	exit 1
+fi
+
+# Collect the names of the kvm statistics (the file names in the kvm debugfs
+# tree) and get their width.
+
+MIN_COL_WIDTH=8	# Maximum width of a number under the header.  The header
+		# should therefore be at least this long.
+i=0
+for STAT in `ls $KVM_STAT_DIR`; do
+	# Filter which statistics to display if a regex was given with the
+	# fields option.
+	if [ -n "$fields" ]; then
+		if ! echo $STAT | grep -E -q "$fields"; then
+			continue
+		fi
+	fi
+	KVM_STAT[$i]=$STAT
+	if [ ${#STAT} -gt $MIN_COL_WIDTH ]; then
+		COL_WIDTH[$i]=${#STAT}
+	else
+		COL_WIDTH[$i]=$MIN_COL_WIDTH
+	fi
+	(( i++ ))
+done
+
+# function get_stats
+#
+# Get the current statistics into the KVM_STAT_VAL[] array.
+function get_stats {
+	if [ "$timestamps" == "yes" ]; then
+		TIMESTAMP=`$TIMESTAMP_CMD`
+	fi
+	for (( i=0; i<${#KVM_STAT[*]}; i++ )); do
+		read KVM_STAT_VAL[$i] < $KVM_STAT_DIR/${KVM_STAT[$i]}
+	done
+}
+
+# function save_stats
+#
+# Save the statistics by copying the KVM_STAT_VAL[] array to the
+# KVM_STAT_VAL_PREV[] array.
+function save_stats {
+	# Save the time stamp, too.
+	if [ "$timestamps" == "yes" ]; then
+		TIMESTAMP_PREV=$TIMESTAMP
+	fi
+	for (( i=0; i<${#KVM_STAT[*]}; i++ )); do
+		KVM_STAT_VAL_PREV[$i]=${KVM_STAT_VAL[$i]}
+	done
+}
+
+if [ "$timestamps" == "yes" ]; then
+	TIMESTAMP_CMD="date +%H:%M:%S"
+
+	# Calculate the width of the time stamp.
+	TIMESTAMP_WIDTH=`$TIMESTAMP_CMD`
+	TIMESTAMP_WIDTH=${#TIMESTAMP_WIDTH}
+fi
+
+# Get one sample of statistics before and after one interval.  We need one
+# sample for "once" mode.  If we are in log mode it will be the first
+# sample of many.
+get_stats
+save_stats
+sleep $interval
+get_stats
+
+if [ "$log" == "no" ];then
+	# Print the statistics in "once" mode.  Each statistic is on its own
+	# line.	 The line contains the statistic name, the raw value of the
+	# statistic's file contents at the start of the sample, and then the
+	# delta of the file contents after one interval.
+
+	# Calculate the field widths for the output.
+	MAX_HEADER_WIDTH=1
+	MAX_VAL_WIDTH=1
+	MAX_VAL_PREV_WIDTH=1
+
+	for (( i=0; i<${#KVM_STAT[*]}; i++ )); do
+		# Find the maximum column width for the statistic names.
+		if [ ${#KVM_STAT[$i]} -gt $MAX_HEADER_WIDTH ]; then
+			MAX_HEADER_WIDTH=${COL_WIDTH[$i]}
+		fi
+
+		# Find the maximum column width for the initial raw statistics.
+		if [ ${#KVM_STAT_VAL_PREV[$i]} -gt $MAX_VAL_PREV_WIDTH ]; then
+			MAX_VAL_PREV_WIDTH=${#KVM_STAT_VAL_PREV[$i]}
+		fi
+
+		# Change the KVM_STAT_VAL[] array to contain the delta between
+		# its current value and the KVM_STAT_VAL_PREV[] value.
+		(( KVM_STAT_VAL[$i] -= KVM_STAT_VAL_PREV[$i] ))
+
+		# Find the maximum column width for the delta statistics.
+		if [ ${#KVM_STAT_VAL[$i]} -gt $MAX_VAL_WIDTH ]; then
+			MAX_VAL_WIDTH=${#KVM_STAT_VAL[$i]}
+		fi
+	done
+
+	for (( i=0; i<${#KVM_STAT[*]}; i++ )); do
+		printf "%-${MAX_HEADER_WIDTH}s  %${MAX_VAL_PREV_WIDTH}d  %${MAX_VAL_WIDTH}d\n" ${KVM_STAT[$i]} ${KVM_STAT_VAL_PREV[$i]} ${KVM_STAT_VAL[$i]}
+	done
+
+	debugfs_restore
+	exit
+fi
+
+#
+# If we get here we are in log mode.
+#
+
+# function print_header
+#
+# Print the log mode column headers for the statistics.
+function print_header {
+	if [ "$timestamps" == "yes" ]; then
+		printf "%-${TIMESTAMP_WIDTH}s" "Time"
+	fi
+	for (( i=0; i<${#KVM_STAT[*]}; i++ )); do
+		printf " %${COL_WIDTH[$i]}s" ${KVM_STAT[$i]}
+	done
+	echo
+}
+
+# function print_stats
+#
+# Print the statistics in log mode, each statistic in its own column.
+function print_stats {
+	if [ "$timestamps" == "yes" ]; then
+		printf "%-${TIMESTAMP_WIDTH}s" $TIMESTAMP
+	fi
+	for (( i=0; i<${#KVM_STAT[*]}; i++ )); do
+		printf " %${COL_WIDTH[$i]}d" $(( ( ${KVM_STAT_VAL[$i]} - ${KVM_STAT_VAL_PREV[$i]} ) / $interval ))
+	done
+	echo
+}
+
+# Turn on the bash checkwinsize option.  It's off by default.
+# checkwinsize causes bash to check the window size after every command
+# and set the LINES and COLUMNS variables.  We want the number of lines
+# on the display so that we know when to redisplay the column headers.
+shopt -s checkwinsize
+
+# function get_rows
+#
+# Get the current number of rows for the terminal.
+# I tried doing this with the bash checkwinsize option and the LINES variable,
+# but bash doesn't set the LINES variable, even with checkwinsize on.
+# If bash doesn't set LINES, use stty to get the display rows instead.
+function get_rows {
+	if [ -n "$LINES" ]; then
+		ROWS=$LINES
+	else
+		ROWS=`stty -a 2>/dev/null | grep rows | sed -e 's/.*rows \([0-9]\+\).*/\1/'`
+		if [ -z "$ROWS" ]; then
+			# Default to 20 rows, the value used by kvm_stat.
+			ROWS=20
+		fi
+	fi
+}
+
+get_rows
+
+# Update the number of rows when the window size changes.
+trap "get_rows" SIGWINCH
+
+LINE=1
+while true; do
+	if [ $LINE -eq 1 ]; then
+		print_header
+	fi
+
+	if [ $LINE -lt $(( $ROWS - 2 )) ]; then
+		(( LINE++ ))
+	else
+		LINE=1
+	fi
+
+	print_stats
+	sleep $interval
+	save_stats
+	get_stats
+done
+
+debugfs_restore
+

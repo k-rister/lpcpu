@@ -1,0 +1,519 @@
+#!/usr/bin/perl
+
+#
+# LPCPU (Linux Performance Customer Profiler Utility): ./postprocess/postprocess-mpstat
+#
+# (C) Copyright IBM Corp. 2016
+#
+# This file is subject to the terms and conditions of the Eclipse
+# Public License.  See the file LICENSE.TXT in the main directory of the
+# distribution for more details.
+#
+
+
+# postprocess the mpstat profiler data
+
+# set the environment variable MPSTAT_NO_NUMA to any value to prevent
+# NUMA aware processing this is useful when MPSTAT data is being
+# processed offline on a different box than where the data was
+# collected and a topology archive is not available, the NUMA aware
+# processing requires that postprocess-mpstat be run on the same
+# machine as where the data was collected or that a topology archive
+# be supplied
+
+use strict;
+#use Data::Dumper;
+use autobench::time;
+use autobench::strings;
+use autobench::topology;
+use autobench::jschart;
+
+if (@ARGV < 1) {
+    print STDERR "postprocess-mpstat: No working directory specified\n";
+    exit 1;
+}
+
+if (@ARGV < 2) {
+    print STDERR "postprocess-mpstat: No identifier specified\n";
+    exit 1;
+}
+
+my $working_directory = $ARGV[0];
+my $identifier = $ARGV[1];
+
+my $input_file;
+my $invocation_id;
+my $topology_archive;
+
+if (@ARGV > 2) {
+    if (@ARGV > 3) {
+	$topology_archive = $ARGV[3];
+    }
+
+    $invocation_id = $ARGV[2];
+
+    $input_file = "mpstat." . $invocation_id . "." .$identifier;
+} else {
+    $input_file = "mpstat." . $identifier;
+}
+
+print "Processing File : $input_file\n";
+
+if (!open(INPUT,"<$working_directory/$input_file")) {
+    print STDERR "postprocess-mpstat: could not open specified input file\n";
+    exit 1;
+}
+
+my $output_directory;
+if (@ARGV > 2) {
+    $output_directory = "$working_directory/mpstat-processed.$invocation_id.$identifier";
+} else {
+    $output_directory = "$working_directory/mpstat-processed.$identifier";
+}
+mkdir $output_directory;
+mkdir "$output_directory/plot-files";
+
+my %cpus;
+my @cpu_data;
+my $mode = 0;
+my @fields;
+my %field_names;
+my @field_names_graphing;
+my $key;
+my $value;
+
+my $current_timestamp = 0;
+my $last_timestamp = 0;
+my $timestamp_wrap_adjustment;
+
+while (<INPUT>) {
+    chomp $_;
+
+    if ($_ =~ /CPU.*iowait/) {
+	if ($_ =~ /gnice/) {
+	    print "Using guest nice mode\n";
+	    %field_names = ( 'user' => 10, 'nice' => 9, 'sys' => 8, 'iowait' => 7, 'irq'  => 6, 'softirq' => 5, 'steal' => 4, 'guest' => 3, 'gnice' => 2, 'idle' => 1 );
+	    @field_names_graphing = ( 'user', 'nice', 'sys', 'irq', 'softirq', 'guest', 'gnice', 'steal', 'iowait', 'idle' );
+
+	    # mpstat output is in the following format
+	    #09:27:20 AM     CPU      %usr     %nice      %sys   %iowait    %steal      %irq     %soft    %guest    %gnice     %idle
+	    #09:27:25 AM     all      0.05      0.00      0.10      0.10      0.00      0.00      0.00      0.00      0.00     99.75
+	} elsif ($_ =~ /guest/) {
+	    print "Using guest mode\n";
+	    %field_names = ( 'user' => 9, 'nice' => 8, 'sys' => 7, 'iowait' => 6, 'irq'  => 5, 'softirq' => 4, 'steal' => 3, 'guest' => 2, 'idle' => 1 );
+	    @field_names_graphing = ( 'user', 'nice', 'sys', 'irq', 'softirq', 'guest', 'steal', 'iowait', 'idle' );
+
+	    # mpstat output is in the following format
+	    #10:15:15     CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest   %idle
+	    #10:15:20     all   62.56    0.00   27.81    0.59    0.02    9.03    0.00    0.00    0.00
+	} elsif ($_ =~ /intr/) {
+	    print "Using int_rate mode\n";
+	    %field_names = ( 'user' => 9, 'nice' => 8, 'sys' => 7, 'iowait' => 6, 'irq'  => 5, 'softirq' => 4, 'steal' => 3, 'idle' => 2, 'int_rate' => 1 );
+	    @field_names_graphing = ( 'user', 'nice', 'sys', 'irq', 'softirq', 'steal', 'iowait', 'idle' );
+
+	    # mpstat output is in the following format
+	    #14:07:31     CPU   %user   %nice    %sys %iowait    %irq   %soft  %steal   %idle    intr/s
+	    #14:07:36     all    9.65    0.00   90.20    0.00    0.05    0.05    0.00    0.05    508.98
+	} else {
+	    print STDERR "postprocess-mpstat: Unrecognized mpstat format\n";
+	    close INPUT;
+	    exit 1;
+	}
+
+	last;
+    }
+}
+
+# seek back to the beginning of the file to start over
+seek INPUT, 0, 0;
+
+while (<INPUT>) {
+    chomp $_;
+
+    if (($mode == 0) && ($_ =~ /CPU/)) {
+	$mode = 1;
+	next;
+    }
+
+    if ($mode == 1) {
+	if (($_ =~ /CPU/) || ($_ =~ /^$/)) {
+	    next;
+	}
+
+	@fields = split(' ', $_);
+
+	if (! exists $cpus{$fields[@fields - (@field_names_graphing + 1)]}) {
+	    $cpus{$fields[@fields - (@field_names_graphing + 1)]} = @cpu_data;
+
+	    if (exists $field_names{'gnice'}) {
+		push @cpu_data, { 'label' => $fields[@fields - (@field_names_graphing + 1)], 'timestamps' => [], 'user' => [], 'nice' => [], 'sys' => [], 'iowait' => [], 'irq' => [], 'softirq' => [], 'steal' => [], 'idle' => [], 'guest' => [], 'gnice' => [] }
+	    } elsif (exists $field_names{'guest'}) {
+		push @cpu_data, { 'label' => $fields[@fields - (@field_names_graphing + 1)], 'timestamps' => [], 'user' => [], 'nice' => [], 'sys' => [], 'iowait' => [], 'irq' => [], 'softirq' => [], 'steal' => [], 'idle' => [], 'guest' => [] }
+	    } else {
+		push @cpu_data, { 'label' => $fields[@fields - (@field_names_graphing + 1)], 'timestamps' => [], 'user' => [], 'nice' => [], 'sys' => [], 'iowait' => [], 'irq' => [], 'softirq' => [], 'steal' => [], 'idle' => [], 'int_rate' => [] }
+	    }
+	}
+
+	$last_timestamp = $current_timestamp;
+
+	# figure out the number of fields (starting at 0) that are part of the timestamp, then use
+	# join to concatenate them together to be fed to the time_in_seconds function
+	$current_timestamp = time_in_seconds(join(' ', @fields[0..(@fields - (@field_names_graphing + 2))]));
+
+	# check if the timestamps have wrapped, give 5% leeway just in case sample timestamps are out of
+	# order for some bizarre reason
+	if ($current_timestamp < ($last_timestamp * .95)) {
+	    # add another day's worth of seconds to the adjustment value
+	    $timestamp_wrap_adjustment += 24*60*60;
+	}
+
+	push @{$cpu_data[$cpus{$fields[@fields - (@field_names_graphing + 1)]}]{'timestamps'}}, $current_timestamp+$timestamp_wrap_adjustment;
+
+	foreach $key (keys %field_names) {
+	    $value = $fields[@fields - $field_names{$key}];
+	    $value = '0.00' if (($value > 110) && ($key ne 'int_rate'));
+	    push @{$cpu_data[$cpus{$fields[@fields - (@field_names_graphing + 1)]}]{$key}}, $value;
+	}
+    }
+}
+
+close INPUT;
+
+#print Dumper \%cpus;
+#print Dumper \@cpu_data;
+#print Dumper \%field_names;
+
+# initialize the topology information
+my $topology;
+if ((@ARGV > 3) && ! exists $ENV{'MPSTAT_NO_NUMA'}) {
+    print "postprocess-mpstat: Loading topology archive from $topology_archive\n";
+    $topology = new autobench::topology(undef, $topology_archive);
+} else {
+    $topology = new autobench::topology;
+}
+my %numa;
+my %numa_data;
+
+if (! exists $ENV{'MPSTAT_NO_NUMA'} && $topology->check_numa_support) {
+    my @numa_nodes = $topology->get_numa_node_list;
+    my $node;
+
+    foreach $node (@numa_nodes) {
+	$numa{$node} = ();
+	my @array = $topology->get_numa_node_online_processors($node);
+	push @{$numa{$node}}, @array;
+    }
+
+    #print Dumper \%numa;
+
+    foreach $node (keys %numa) {
+	# make sure that the current NUMA node has online processors
+	if (@{$numa{$node}} == 0) {
+	    next;
+	}
+
+	$numa_data{$node} = {};
+
+	foreach my $cpu (@{$numa{$node}}) {
+	    # when processing the first cpu of the node copy the
+	    # timestamps over
+	    if (! exists $numa_data{$node}{'timestamps'}) {
+		$numa_data{$node}{'timestamps'} = ();
+		push @{$numa_data{$node}{'timestamps'}}, @{$cpu_data[$cpus{$cpu}]{'timestamps'}};
+	    }
+
+	    foreach my $field (keys %field_names) {
+		if (! exists $numa_data{$node}{$field}) {
+		    $numa_data{$node}{$field} = ();
+		}
+
+		for (my $i=0; $i<@{$cpu_data[$cpus{$cpu}]{$field}}; $i++) {
+		    if (! exists $numa_data{$node}{$field}[$i]) {
+			$numa_data{$node}{$field}[$i] = 0;
+		    }
+
+		    $numa_data{$node}{$field}[$i] += $cpu_data[$cpus{$cpu}]{$field}[$i];
+		}
+	    }
+	}
+
+	foreach my $field (keys %field_names) {
+	    # int_rate should be summed, not averaged
+	    if ($field eq "int_rate") {
+		next;
+	    }
+
+	    for (my $i=0; $i<@{$numa_data{$node}{$field}}; $i++) {
+		$numa_data{$node}{$field}[$i] /= scalar(@{$numa{$node}});
+	    }
+	}
+    }
+} else {
+    if (exists $ENV{'MPSTAT_NO_NUMA'}) {
+	if (@ARGV > 3) {
+	    print "You specified a topology archive to load ($topology_archive) but you also set the MPSTAT_NO_NUMA environment variable.  This does not make much sense.\n";
+	} else {
+	    print "NUMA aware processing explicity disabled\n";
+	}
+    }
+
+    if (! $topology->check_numa_support) {
+	print "NUMA toplogy information not available\n";
+    }
+}
+
+#print Dumper \%numa_data;
+
+my $key_1;
+my $key_2;
+my $i;
+
+foreach $key_1 (keys %cpus) {
+    foreach $key_2 (keys %field_names) {
+	if (!open(OUTPUT_FILE, ">$output_directory/plot-files/cpu-${key_1}_${key_2}.plot")) {
+	    print STDERR "postprocess-mpstat: Failed to open output file $key_2 for cpu $key_1.\n";
+	    next;
+	} else {
+	    print OUTPUT_FILE "#LABEL:cpu $key_1 $key_2\n";
+
+	    for ($i=0; $i<@{$cpu_data[$cpus{$key_1}]{$key_2}}; $i++) {
+		print OUTPUT_FILE ($cpu_data[$cpus{$key_1}]{'timestamps'}[$i]-$cpu_data[$cpus{$key_1}]{'timestamps'}[0]) . ' ' . $cpu_data[$cpus{$key_1}]{$key_2}[$i] . "\n";
+	    }
+
+	    close OUTPUT_FILE;
+	}
+    }
+}
+
+if (! exists $ENV{'MPSTAT_NO_NUMA'} && $topology->check_numa_support) {
+    foreach $key_1 (keys %numa) {
+	# make sure that the current NUMA node has online processors
+	if (@{$numa{$key_1}} == 0) {
+	    next;
+	}
+
+	foreach $key_2 (keys %field_names) {
+	    if (!open(OUTPUT_FILE, ">$output_directory/plot-files/numa-${key_1}_${key_2}.plot")) {
+		print STDERR "postprocess-mpstat: Failed to open output file $key_2 for NUMA node $key_1.\n";
+		next;
+	    } else {
+		print OUTPUT_FILE "#LABEL:NUMA Node $key_1 $key_2\n";
+
+		for ($i=0; $i<@{$numa_data{$key_1}{$key_2}}; $i++) {
+		    print OUTPUT_FILE ($numa_data{$key_1}{'timestamps'}[$i]-$numa_data{$key_1}{'timestamps'}[0]) . ' ' . $numa_data{$key_1}{$key_2}[$i] . "\n";
+		}
+
+		close OUTPUT_FILE;
+	    }
+	}
+    }
+}
+
+if (! $ENV{'FORCE_CHART_PL'}) {
+    my $chart_page = new autobench::jschart("mpstat charts");
+    if ($ENV{'FORCE_JSCHART_REMOTE_LIBRARY'}) {
+	$chart_page->set_library_remote;
+    }
+
+    if (! $ENV{'FORCE_JSCHART_NO_PACKED_PLOTFILES'}) {
+	$chart_page->enable_packed_plotfiles($output_directory);
+    }
+
+    $chart_page->enable_raw_data_file_links('../');
+
+    my $counter = 0;
+
+    $chart_page->add_link('cpu_link', '#cpu_section', 'Generic CPU Utilization');
+
+    if (! exists $ENV{'MPSTAT_NO_NUMA'} && $topology->check_numa_support) {
+	$chart_page->add_link('numa_link', '#numa_section', 'Per NUMA Node CPU Utilization');
+    }
+
+    $chart_page->add_section('cpu_section', 'Generic CPU Utilization');
+
+    for ($i=0; $i<@cpu_data; $i++) {
+	$chart_page->add_chart('cpu_' . $cpu_data[$i]{'label'}, 'stacked', 'CPU ' . $cpu_data[$i]{'label'}, 'Time (secs.)', 'CPU Utilization');
+	$chart_page->add_axis_range_bound('cpu_' . $cpu_data[$i]{'label'}, 'y', 'min', 0);
+	$chart_page->add_axis_range_bound('cpu_' . $cpu_data[$i]{'label'}, 'y', 'max', 100);
+
+	foreach $key_2 (@field_names_graphing) {
+	    $chart_page->add_plots('cpu_' . $cpu_data[$i]{'label'}, 'cpu-' . $cpu_data[$i]{'label'} . '_' . $key_2);
+	}
+
+	$chart_page->add_raw_data_sources('cpu_' . $cpu_data[$i]{'label'}, $input_file);
+
+	$counter++;
+
+	if ((exists $field_names{'int_rate'}) && ($counter == 2)) {
+	    $chart_page->add_chart('interrupt_rate', 'line', 'Interrupt Rate', 'Time (secs.)', 'Interrupts/sec.');
+
+	    foreach my $key (keys %cpus) {
+		$chart_page->add_plots('interrupt_rate', 'cpu-' . $key . '_int_rate');
+	    }
+
+	    $chart_page->add_raw_data_sources('interrupt_rate', $input_file);
+
+	    $counter++;
+	}
+    }
+
+    if (! exists $ENV{'MPSTAT_NO_NUMA'} && $topology->check_numa_support) {
+	$chart_page->add_section('numa_section', 'Per NUMA Node CPU Utilization');
+
+	foreach my $i (sort { $a <=> $b } (keys %numa_data)) {
+	    # make sure that the current NUMA node has online processors
+	    if (@{$numa{$i}} > 0) {
+		$chart_page->add_chart('numa_' . $i, 'stacked', 'NUMA Node ' . $i, 'Time (secs.)', 'CPU Utilization');
+		$chart_page->add_axis_range_bound('numa_' . $i, 'y', 'min', 0);
+		$chart_page->add_axis_range_bound('numa_' . $i, 'y', 'max', 100);
+
+		foreach $key_2 (@field_names_graphing) {
+		    $chart_page->add_plots('numa_' . $i, 'numa-' . $i . '_' . $key_2);
+		}
+
+		if (exists $field_names{'int_rate'}) {
+		    $chart_page->add_chart('numa_interrupts_' . $i, 'line', 'NUMA Node ' . $i . ' Interrupt Rate', 'Time (secs.)', 'Interrupts/sec.');
+		    $chart_page->add_plots('numa_interupts_' . $i, 'numa-' . $i . '_int_rate');
+		}
+	    }
+	}
+    }
+
+    if (!open(CHART_HTML, ">$output_directory/chart.html")) {
+	print STDERR "postprocess-mpstat: Could not create chart.html file\n";
+	exit 1;
+    } else {
+	chmod (0644, "$output_directory/chart.html");
+
+	print CHART_HTML $chart_page->dump_page;
+
+	close CHART_HTML;
+
+	if (! $ENV{'FORCE_JSCHART_NO_PACKED_PLOTFILES'}) {
+	    # clean up the non-packed plotfiles
+	    my $deleted_plotfile_count = unlink glob "$output_directory/plot-files/*.plot";
+	    #print "Deleted $deleted_plotfile_count plot files\n";
+	    if (! rmdir "$output_directory/plot-files") {
+		print STDERR "ERROR: Failed to delete $output_directory/plot-files!\n";
+	    }
+	}
+    }
+} else {
+    if (!open(CHART_SCRIPT, ">$output_directory/chart.sh")) {
+	print STDERR "postprocess-mpstat: Could not create chart.sh file\n";
+	exit 1;
+    } else {
+	chmod (0777, "$output_directory/chart.sh");
+
+	print CHART_SCRIPT "#!/bin/bash\n\n";
+	print CHART_SCRIPT 'DIR=`dirname $0`' . "\n\n";
+	print CHART_SCRIPT 'if [ $# != 2 ]; then' . "\n";
+	print CHART_SCRIPT '  echo "You must specify the path to the chart.pl script and the Chart Directory libraries."' . "\n";
+	print CHART_SCRIPT '  exit 1' . "\n";
+	print CHART_SCRIPT 'fi' . "\n\n";
+	print CHART_SCRIPT 'SCRIPT=$1' . "\n";
+	print CHART_SCRIPT 'LIBRARIES=$2' . "\n\n";
+	print CHART_SCRIPT 'export PERL5LIB=$LIBRARIES' . "\n\n";
+	print CHART_SCRIPT 'pushd $DIR > /dev/null' . "\n\n";
+	my $max_index = @cpu_data + 1 + 2 * %numa_data;
+
+	if (exists $field_names{'int_rate'}) {
+	    print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . auto_prepend(2, $max_index) . ' Interrupt Rate" -x "Time (Secs.)" -y "Interrupts/sec" plot-files/cpu*int_rate.plot' . "\n\n";
+	}
+
+	my $counter = 1;
+
+	for ($i=0; $i<@cpu_data; $i++) {
+	    print CHART_SCRIPT '$SCRIPT --table html -s stackedlines --title "' . auto_prepend($counter, $max_index) . ' - CPU ' . $cpu_data[$i]{'label'} . '" -x "Time (secs.)" -y "CPU Utilization" --y-range=0:100 --legend-position=bottom ';
+
+	    foreach $key_2 (@field_names_graphing) {
+		print CHART_SCRIPT ' plot-files/cpu-' . $cpu_data[$i]{'label'} . '_' . $key_2 . '.plot';
+	    }
+
+	    print CHART_SCRIPT "\n\n";
+
+	    $counter++;
+
+	    if ((exists $field_names{'int_rate'}) && ($counter == 2)) {
+		$counter++;
+	    }
+	}
+
+	if (! exists $ENV{'MPSTAT_NO_NUMA'} && $topology->check_numa_support) {
+	    foreach my $i (sort { $a <=> $b } (keys %numa_data)) {
+		# make sure that the current NUMA node has online processors
+		if (@{$numa{$i}} > 0) {
+		    print CHART_SCRIPT '$SCRIPT --table html -s stackedlines --title "' . auto_prepend($counter, $max_index) . ' - NUMA Node ' . $i . '" -x "Time (secs.)" -y "CPU Utilization" --y-range=0:100 --legend-position=bottom ';
+
+		    foreach $key_2 (@field_names_graphing) {
+			print CHART_SCRIPT ' plot-files/numa-' . $i . '_' . $key_2 . '.plot';
+		    }
+
+		    print CHART_SCRIPT "\n\n";
+
+		    $counter++;
+
+		    if (exists $field_names{'int_rate'}) {
+			print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . auto_prepend($counter, $max_index) . ' - NUMA Node ' . $i . ' Interrupt Rate" -x "Time (secs.)" -y "Interrupts/sec" plot-files/numa-' . $i . '_int_rate.plot' . "\n\n";
+			$counter++;
+		    }
+		}
+	    }
+	}
+
+	print CHART_SCRIPT 'echo -e "<html>\n<head>\n<title>mpstat Charts</title>\n</head>\n<body>\n" > chart.html' . "\n";
+
+	print CHART_SCRIPT 'echo -e "<a href=\'#cpu\'>Generic CPU Utilization</a>" >> chart.html' . "\n";
+
+	if (! exists $ENV{'MPSTAT_NO_NUMA'} && $topology->check_numa_support) {
+	    print CHART_SCRIPT 'echo -e "<a href=\'#numa\'>Per NUMA Node CPU Utilization</a>" >> chart.html' . "\n";
+	}
+
+	print CHART_SCRIPT 'echo -e "<a name=\'cpu\'><h1>Generic CPU Utilization</h1></a>" >> chart.html' . "\n";
+	if (exists $field_names{'int_rate'}) {
+	    print CHART_SCRIPT 'for i in `ls -1 *CPU*.png *Interrupt_Rate*.png`; do' . "\n";
+	} else {
+	    print CHART_SCRIPT 'for i in `ls -1 *CPU*.png`; do' . "\n";
+	}
+	print CHART_SCRIPT '  echo -e "<table>\n<tr valign=\'top\'>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  echo -e "<td><img src=\'$i\'></td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  html_file=`echo $i | sed -e "s/png/html/"`' . "\n";
+	print CHART_SCRIPT '  if [ -e $html_file ]; then' . "\n";
+	print CHART_SCRIPT '    echo -e "<td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '    cat $html_file >> chart.html' . "\n";
+	print CHART_SCRIPT '    echo -e "</td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  fi' . "\n";
+	print CHART_SCRIPT '  echo -e "</tr>\n</table>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT 'done' . "\n\n";
+
+	if (! exists $ENV{'MPSTAT_NO_NUMA'} && $topology->check_numa_support) {
+	    print CHART_SCRIPT 'echo -e "<a name=\'numa\'><h1>Per NUMA Node CPU Utilization</h1></a>" >> chart.html' . "\n";
+
+	    print CHART_SCRIPT 'echo -e "<table border=\'1\'>\n<tr><th>NUMA Node</th><th>Node CPUs</th></tr>\n" >> chart.html' . "\n";
+	    foreach my $node (sort { $a <=> $b } (keys %numa)) {
+		print CHART_SCRIPT 'echo -e "<tr><td>' . $node . '</td><td>';
+		foreach my $cpu (sort { $a <=> $b } (@{$numa{$node}})) {
+		    print CHART_SCRIPT "$cpu ";
+		}
+		print CHART_SCRIPT '</td></tr>\n" >> chart.html' . "\n";
+	    }
+	    print CHART_SCRIPT 'echo -e "</table>\n" >> chart.html' . "\n";
+
+	    print CHART_SCRIPT 'for i in `ls -1 *NUMA*.png`; do' . "\n";
+	    print CHART_SCRIPT '  echo -e "<table>\n<tr valign=\'top\'>\n" >> chart.html' . "\n";
+	    print CHART_SCRIPT '  echo -e "<td><img src=\'$i\'></td>\n" >> chart.html' . "\n";
+	    print CHART_SCRIPT '  html_file=`echo $i | sed -e "s/png/html/"`' . "\n";
+	    print CHART_SCRIPT '  if [ -e $html_file ]; then' . "\n";
+	    print CHART_SCRIPT '    echo -e "<td>\n" >> chart.html' . "\n";
+	    print CHART_SCRIPT '    cat $html_file >> chart.html' . "\n";
+	    print CHART_SCRIPT '    echo -e "</td>\n" >> chart.html' . "\n";
+	    print CHART_SCRIPT '  fi' . "\n";
+	    print CHART_SCRIPT '  echo -e "</tr>\n</table>\n" >> chart.html' . "\n";
+	    print CHART_SCRIPT 'done' . "\n\n";
+	}
+
+	print CHART_SCRIPT 'echo -e "</body>\n</html>\n" >> chart.html' . "\n";
+
+	close CHART_SCRIPT;
+    }
+}

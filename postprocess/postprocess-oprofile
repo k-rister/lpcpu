@@ -1,0 +1,362 @@
+#!/usr/bin/perl
+
+#
+# LPCPU (Linux Performance Customer Profiler Utility): ./postprocess/postprocess-oprofile
+#
+# (C) Copyright IBM Corp. 2016
+#
+# This file is subject to the terms and conditions of the Eclipse
+# Public License.  See the file LICENSE.TXT in the main directory of the
+# distribution for more details.
+#
+
+#
+#  Usage: postprocess-oprofile WORKING_DIR RUN_ID [INVOCATION_ID]
+#
+#         WORKING_DIR       Directory that contains the "mysql-profiler.NNN" profile data directory
+#         RUN_ID            The run identifier (NNN) used for the mysql profiler directories
+#         INVOCATION_ID     Optional parameter to define the invocation id when using the next generation profiling infrastructure
+
+use strict;
+
+die "postprocess-oprofile: No working directory specified\n" if (@ARGV < 1);
+die "postprocess-oprofile: No identifier specified\n"        if (@ARGV < 2);
+
+my $oprofile_dir = $ARGV[0];
+my $run_id       = $ARGV[1];
+my $invocation_id;
+
+if (@ARGV > 2) {
+    $invocation_id = $ARGV[2];
+}
+
+my $plot_files = "plot_files";
+
+my $oprofile_processed;
+if (@ARGV > 2) {
+    $oprofile_processed = "$oprofile_dir/oprofile-processed.$invocation_id.$run_id";
+} else {
+    $oprofile_processed = "$oprofile_dir/oprofile-processed.$run_id";
+}
+my $oprofile_plotfiles = "$oprofile_processed/$plot_files";
+
+mkdir $oprofile_processed || die("postprocess-oprofile: Unable to create directory $oprofile_processed: $!\n");
+mkdir $oprofile_plotfiles || die("postprocess-oprofile: Unable to create directory $oprofile_plotfiles: $!\n");
+
+my $input_file_full_name;
+my $input_file_full;
+my $input_file_brief_name;
+my $input_file_brief;
+
+if (@ARGV > 2) {
+    $input_file_full_name  = "oprofile.$invocation_id.$run_id";
+    $input_file_brief_name = "oprofile-brief.$invocation_id.$run_id";
+} else {
+    $input_file_full_name  = "oprofile.$run_id";
+    $input_file_brief_name = "oprofile-brief.$run_id";
+}
+
+$input_file_full = "$oprofile_dir/$input_file_full_name";
+$input_file_brief = "$oprofile_dir/$input_file_brief_name";
+
+# Sample Percentages/Counts (top 10) - full file
+print "Processing File : $input_file_full_name\n";
+my $entries = 0;
+my $regex = "(\\d+)\\s+(\\d+\\.\\d+)\\s+";
+my $samples_found = 0;
+my @sample_counts = (), my @sample_percents = (), my @sample_names = ();
+open(STATS, "< $input_file_full") || die("postprocess-oprofile: Unable to open $input_file_full: $!\n");
+while (<STATS>) {
+	# Counted ...
+	if (/^Counted /) {
+		$entries++;
+		if ($entries > 1) {
+			# We don't collect the other sample data, but need to match it
+			$regex = "$regex\\d+\\s+\\d+\\.\\d+\\s+";
+		}
+	}
+	# 40242758 36.5793  anon (tgid:5712 range:0x2aaab6b43000-0x2aaab7343000) java                     (no symbols)
+	elsif (/${regex}anon\s+\(.*\)\s+(\S+)/) {
+		push @sample_counts, $1;
+		push @sample_percents, $2;
+		push @sample_names, "$3 - anon";
+		$samples_found++;
+	}
+	# 1283188   1.1664  libj9thr24.so            java                     j9thread_spinlock_acquire
+	elsif (/${regex}(\S+)\s+(\S+)\s+(\S+)/) {
+		push @sample_counts, $1;
+		push @sample_percents, $2;
+		push @sample_names, "$4 - $3 - $5";
+		$samples_found++;
+	}
+	last if ($samples_found >= 10);
+}
+close STATS;
+
+my $count = @sample_names;
+my $sample, my $value, my $fname;
+my $count_plots = "", my $percent_plots = "";
+for (my $i = 0; $i < $count; $i++) {
+	$sample = shift @sample_names;
+
+	$value = shift @sample_counts;
+	$fname = "count_$i";
+	open(PF, "> $oprofile_plotfiles/$fname") || die("postprocess-oprofile: Unable to open $oprofile_plotfiles/$fname: $!\n");
+	print PF "#LABEL:$sample\n";
+	print PF "$value\n";
+	close PF;
+	$count_plots .= "./$plot_files/$fname ";
+
+	$value = shift @sample_percents;
+	$fname = "percent_$i";
+	open(PF, "> $oprofile_plotfiles/$fname") || die("postprocess-oprofile: Unable to open $oprofile_plotfiles/$fname: $!\n");
+	print PF "#LABEL:$sample\n";
+	print PF "$value\n";
+	close PF;
+	$percent_plots .= "./$plot_files/$fname ";
+}
+
+# Format the OProfile data
+open(HTML, ">$oprofile_processed/oprofile.html") || die("postprocess-oprofile: Unable to open $oprofile_processed/oprofile.html: $!\n");
+print HTML "<html>\n<head>\n<title>OProfile Data ($input_file_full)</title>\n</head>\n<body>\n";
+print HTML "<pre style=\"font-size: smaller\">\n";
+
+open(STATS, "< $input_file_full") || die("postprocess-oprofile: Unable to open $input_file_full: $!\n");
+while (<STATS>) {
+	next if (/^warning/);
+	print HTML "$_";
+}
+close STATS;
+
+print HTML "</pre>\n";
+print HTML "</body>\n</html>\n";
+close HTML;
+
+
+# Sample Percentages/Counts (top 5) - brief file
+print "Processing File : $input_file_brief_name\n";
+my $entries = 0;
+my $regex = "(\\d+)\\s+(\\d+\\.\\d+)\\s+";
+my $app_samples_found = 0;
+my @app_sample_counts = (), my @app_sample_percents = (), my @app_sample_names = ();
+my $img_samples_found = 0;
+my @img_sample_counts, my @img_sample_percents, my @img_sample_names;
+my $save_img_samples = 0;
+open(STATS, "< $input_file_brief") || die("postprocess-oprofile: Unable to open $input_file_brief: $!\n");
+while (<STATS>) {
+	if (/^Counted /) {
+		$entries++;
+		if ($entries > 1) {
+			# We don't collect the other sample data, but need to match it
+			$regex = "$regex\\d+\\s+\\d+\\.\\d+\\s+";
+		}
+	}
+	# 108408172 98.5393 java
+	elsif (/^ *${regex}(\S+)/) {
+		if ($save_img_samples) {
+			push @app_sample_counts, [ @img_sample_counts ];
+			push @app_sample_percents, [ @img_sample_percents ];
+			push @app_sample_names, [ @img_sample_names ];
+			$save_img_samples = 0;
+		}
+		last if ($app_samples_found >= 5);
+		
+		push @app_sample_counts, $1;
+		push @app_sample_percents, $2;
+		push @app_sample_names, $3;
+		$app_samples_found++;
+		@img_sample_counts = ();
+		@img_sample_percents = ();
+		@img_sample_names = ();
+		$img_samples_found = 0;
+		$save_img_samples = 1;
+	}
+	#	 40242758 37.1215 anon (tgid:5712 range:0x2aaab6b43000-0x2aaab7343000)
+	#	  5618671  5.1829 libj9jit24.so
+	elsif (/^\t\s*${regex}anon/) {
+		next if ($img_samples_found >= 10);
+
+		push @img_sample_counts, $1;
+		push @img_sample_percents, $2;
+		push @img_sample_names, "anon";
+		$img_samples_found++;
+	}
+	elsif (/^\t\s*${regex}(\S+)/) {
+		next if ($img_samples_found >= 10);
+
+		push @img_sample_counts, $1;
+		push @img_sample_percents, $2;
+		push @img_sample_names, $3;
+		$img_samples_found++;
+	}
+}
+if ($save_img_samples) {
+	push @app_sample_counts, [ @img_sample_counts ];
+	push @app_sample_percents, [ @img_sample_percents ];
+	push @app_sample_names, [ @img_sample_names ];
+}
+close STATS;
+
+my $app_name;
+my $app_count_plots = "", my $app_percent_plots = "";
+my $aref, my @app_img_names = (), my @app_img_counts = (), my @app_img_percents;
+my $img_count_plots = "", my $img_percent_plots = "";
+for (my $i = 0, $app_name = shift @app_sample_names; $app_name; $app_name = shift @app_sample_names) {
+	$value = shift @app_sample_counts;
+	$fname = "app_count_$i";
+	open(PF, "> $oprofile_plotfiles/$fname") || die("postprocess-oprofile: Unable to open $oprofile_plotfiles/$fname: $!\n");
+	print PF "#LABEL:$app_name\n";
+	print PF "$value\n";
+	close PF;
+	$app_count_plots .= "./$plot_files/$fname ";
+
+	$value = shift @app_sample_percents;
+	$fname = "app_percent_$i";
+	open(PF, "> $oprofile_plotfiles/$fname") || die("postprocess-oprofile: Unable to open $oprofile_plotfiles/$fname: $!\n");
+	print PF "#LABEL:$app_name\n";
+	print PF "$value\n";
+	close PF;
+	$app_percent_plots .= "./$plot_files/$fname ";
+
+	$aref = shift @app_sample_counts;
+	@img_sample_counts = @$aref;
+	$aref = shift @app_sample_percents;
+	@img_sample_percents = @$aref;
+	$aref = shift @app_sample_names;
+	@img_sample_names = @$aref;
+
+	$count = @img_sample_names;
+	$img_count_plots = "", $img_percent_plots = "";
+	for (my $j = 0; $j < $count; $j++) {
+		$sample = shift @img_sample_names;
+
+		$value = shift @img_sample_counts;
+		$fname = "app_img_count_$i" . "_$j";
+		open(PF, "> $oprofile_plotfiles/$fname") || die("postprocess-oprofile: Unable to open $oprofile_plotfiles/$fname: $!\n");
+		print PF "#LABEL:$sample\n";
+		print PF "$value\n";
+		close PF;
+		$img_count_plots .= "./$plot_files/$fname ";
+
+		$value = shift @img_sample_percents;
+		$fname = "app_img_percent_$i" . "_$j";
+		open(PF, "> $oprofile_plotfiles/$fname") || die("postprocess-oprofile: Unable to open $oprofile_plotfiles/$fname: $!\n");
+		print PF "#LABEL:$sample\n";
+		print PF "$value\n";
+		close PF;
+		$img_percent_plots .= "./$plot_files/$fname ";
+	}
+	push @app_img_names, $app_name;
+	push @app_img_counts, $img_count_plots;
+	push @app_img_percents, $img_percent_plots;
+	$i++;
+}
+
+# Format the OProfile brief data
+open(HTML, ">$oprofile_processed/oprofile-brief.html") || die("postprocess-oprofile: Unable to open $oprofile_processed/oprofile.html: $!\n");
+print HTML "<html>\n<head>\n<title>OProfile Brief Data ($input_file_brief)</title>\n</head>\n<body>\n";
+print HTML "<pre style=\"font-size: smaller\">\n";
+
+open(STATS, "< $input_file_brief") || die("postprocess-oprofile: Unable to open $input_file_brief: $!\n");
+while (<STATS>) {
+	next if (/^warning/);
+	print HTML "$_";
+}
+close STATS;
+
+print HTML "</pre>\n";
+print HTML "</body>\n</html>\n";
+close HTML;
+
+
+#########################################################################################################################
+
+open(CHART_SCRIPT, ">$oprofile_processed/chart.sh") || die("postprocess-oprofile: Unable to open $oprofile_processed/chart.sh: $!\n");
+
+
+print CHART_SCRIPT "#!/bin/bash\n\n";
+print CHART_SCRIPT 'DIR=`dirname $0`' . "\n\n";
+print CHART_SCRIPT 'if [ $# != 2 ]; then' . "\n";
+print CHART_SCRIPT '  echo "You must specify the path to the chart.pl script and the Chart Directory libraries."' . "\n";
+print CHART_SCRIPT '  exit 1' . "\n";
+print CHART_SCRIPT 'fi' . "\n\n";
+print CHART_SCRIPT 'SCRIPT="$1 --legend-position=right"' . "\n";
+print CHART_SCRIPT 'LIBRARIES=$2' . "\n\n";
+print CHART_SCRIPT 'export PERL5LIB=$LIBRARIES' . "\n\n";
+print CHART_SCRIPT 'pushd $DIR > /dev/null' . "\n\n";
+
+# Sample Percentages
+print CHART_SCRIPT '$SCRIPT -s bar --title "01 sample-percentages" -x "Samples" -y "% Samples" --y-range=0:101 ' . $percent_plots . "\n";
+
+# Sample Counts
+print CHART_SCRIPT '$SCRIPT -s bar --title "02 sample-counts" -x "Samples" -y "# Samples" ' . $count_plots . "\n";
+
+# App Percentages
+print CHART_SCRIPT '$SCRIPT -s bar --title "11 app-percentages" -x "Apps" -y "% Apps" --y-range=0:101 ' . $app_percent_plots . "\n";
+
+# App Counts
+print CHART_SCRIPT '$SCRIPT -s bar --title "12 app-counts" -x "Apps" -y "# Apps" ' . $app_count_plots . "\n";
+
+# App/Image Percents/Counts
+my $img_plots, my $img_number = 21;
+while (($app_name = shift @app_img_names)) {
+	$img_plots = shift @app_img_percents;
+	if ($img_plots !~ /^\s*$/) {
+		printf CHART_SCRIPT "\$SCRIPT -s bar --title \"%d $app_name-percentages\" -x \"Images\" -y \"% Samples\" --y-range=0:101 $img_plots \n", $img_number;
+	}
+
+	$img_plots = shift @app_img_counts;
+	if ($img_plots !~ /^\s*$/) {
+		printf CHART_SCRIPT "\$SCRIPT -s bar --title \"%d $app_name-counts\" -x \"Images\" -y \"# Samples\" $img_plots \n", ($img_number + 1);
+	}
+	$img_number += 10;
+}
+
+print CHART_SCRIPT 'echo -e "<html>\n<head>\n<title>OProfile Charts</title>\n</head>\n<body>\n" > chart.html' . "\n";
+
+print CHART_SCRIPT 'echo -e "<a href=\'./oprofile.html\'><b>OProfile Data</b> (';
+print CHART_SCRIPT "$input_file_full";
+print CHART_SCRIPT ')</a><br>\n" >> chart.html' . "\n";
+
+print CHART_SCRIPT 'echo -e "<a href=\'./oprofile-brief.html\'><b>OProfile Brief Data</b> (';
+print CHART_SCRIPT "$input_file_brief";
+print CHART_SCRIPT ')</a><br>\n" >> chart.html' . "\n";
+
+my $oprofile_breakout;
+if (@ARGV > 2) {
+    $oprofile_breakout  = "oprofile.breakout.$invocation_id.$run_id";
+} else {
+    $oprofile_breakout  = "oprofile.breakout.$run_id";
+}
+
+if (-s "$oprofile_dir/$oprofile_breakout/oprofile-callgraph") {
+	print CHART_SCRIPT 'echo -e "<a href=\'';
+	print CHART_SCRIPT "../$oprofile_breakout/oprofile-callgraph";
+	print CHART_SCRIPT '\'><b>OProfile Call Graph</b></a><br>\n" >> chart.html' . "\n";
+}
+
+if (opendir(DIR, "$oprofile_dir/$oprofile_breakout")) {
+	my $direntry;
+	while (($direntry = readdir(DIR))) {
+		if ($direntry =~ /.html$/) {
+			print CHART_SCRIPT 'echo -e "<a href=\'';
+			print CHART_SCRIPT "../$oprofile_breakout/$direntry";
+			print CHART_SCRIPT '\'><b>Annotated Output: ';
+			print CHART_SCRIPT "$direntry";
+			print CHART_SCRIPT '</b></a><br>\n" >> chart.html' . "\n";
+		}
+	}
+	closedir DIR;
+
+	print CHART_SCRIPT 'echo -e "<br>\n" >> chart.html' . "\n";
+}
+
+print CHART_SCRIPT 'for i in `ls -1 *.png`; do' . "\n";
+print CHART_SCRIPT '  echo -e "<img src=\'$i\'><br/><br/>" >> chart.html' . "\n";
+print CHART_SCRIPT 'done' . "\n\n";
+
+print CHART_SCRIPT 'echo -e "</body>\n</html>\n" >> chart.html' . "\n";
+
+close CHART_SCRIPT;
+
+chmod (0777, "$oprofile_processed/chart.sh");

@@ -1,0 +1,916 @@
+#! /usr/bin/perl
+
+#
+# LPCPU (Linux Performance Customer Profiler Utility): ./postprocess/postprocess-process-cpu
+#
+# (C) Copyright IBM Corp. 2016
+#
+# This file is subject to the terms and conditions of the Eclipse
+# Public License.  See the file LICENSE.TXT in the main directory of the
+# distribution for more details.
+#
+
+
+use strict;
+use Getopt::Long;
+use File::Basename;
+#use Data::Dumper;
+use autobench::strings;
+use autobench::jschart;
+
+# For sorting PIDS numerically instead of alphabetically.
+sub numerically { $a <=> $b }
+
+# if specified memory has unit, make sure it gets converted to KB
+sub mem_size {
+    my $var = shift;
+    if ($var =~ /[TGMK]B$/) {
+	$var =~ m/([0-9\.]+)([TGMK]B)$/;
+	my $value = $1;
+	my $unit = $2;
+
+	if ($unit =~ /TB/) {
+	    return $value * 1024 * 1024 * 1024;
+	} elsif ($unit =~ /GB/) {
+	    return $value * 1024 * 1024;
+	} elsif ($unit =~ /MB/) {
+	    return $value * 1024;
+	} elsif ($unit =~ /KB/) {
+	    return $value;
+	} else {
+	    print STDERR "unrecognized unit in $var\n";
+	}
+    }
+
+    return $var;
+}
+
+# Parse parameters.
+my @cmd_filters;
+my %opt_hash = ("c" => \@cmd_filters);
+
+GetOptions(\%opt_hash, "c=s@");
+
+for (my $i=0; $i<@cmd_filters; $i++) {
+    $cmd_filters[$i] =~ s/^'//;
+    $cmd_filters[$i] =~ s/'$//;
+}
+
+if (@ARGV < 1) {
+    print STDERR "postprocess-process-cpu: No working directory specified\n";
+    exit 1;
+}
+
+if (@ARGV < 2) {
+    print STDERR "postprocess-process-cpu: No identifier specified\n";
+    exit 1;
+}
+
+my $working_directory = $ARGV[0];
+my $identifier = $ARGV[1];
+
+my $input_file;
+my $invocation_id;
+
+if (@ARGV > 2) {
+    $invocation_id = $ARGV[2];
+
+    $input_file = "process-cpu." . $invocation_id . "." . $identifier;
+} else {
+    $input_file = "process-cpu." . $identifier;
+}
+
+print "Processing File : $input_file\n";
+
+my $process_cpu_interval = -1;
+
+if (!open(INPUT,"<$working_directory/$input_file")) {
+    print STDERR "postprocess-process-cpu: could not open specified input file\n";
+    exit 1;
+}
+
+my $output_directory;
+
+if (@ARGV > 2) {
+    $output_directory = "$working_directory/process-cpu-processed.$invocation_id.$identifier";
+} else {
+    $output_directory = "$working_directory/process-cpu-processed.$identifier";
+}
+mkdir $output_directory;
+mkdir "$output_directory/plot-files";
+
+open(AVERAGED_OUTPUT,">$output_directory/averaged-process-cpu");
+
+my $do_task_io = 0;
+my $do_raw = 1;
+my $do_guest_mode = 0;
+
+my $timestamp;
+my $foo;
+
+my $sys_user;
+my $sys_nice;
+my $sys_system;
+my $sys_idle;
+my $sys_iowait;
+my $sys_irq;
+my $sys_softirq;
+my $sys_steal;
+my $sys_guest;
+my $sys_total;
+
+my $total_user = 0;
+my $total_nice = 0;
+my $total_system = 0;
+my $total_idle = 0;
+my $total_iowait = 0;
+my $total_irq = 0;
+my $total_softirq = 0;
+my $total_steal = 0;
+my $total_guest = 0;
+my $total_total = 0;
+
+my $sample_count = 0;
+
+my %pid_stats;
+
+my @timestamps;
+
+# Determine the interval by getting the ten differences between the first
+# eleven, or however many are there, time stamps in the output and calculating
+# their average.
+while (<INPUT>) {
+    my $line = $_;
+    chomp($line);
+
+    if ($line =~ /^Timestamp:/) {
+	($foo, $timestamp) = split(" Time: ", $line);
+	push @timestamps, $timestamp;
+    }
+
+    last if (@timestamps >= 11);
+}
+
+if (@timestamps >= 2) {
+    my $total = 0;
+
+    for (my $i=1; $i<@timestamps; $i++) {
+	$total += $timestamps[$i] - $timestamps[$i-1];
+    }
+
+    # Use sprintf to round the average to the nearest integer.
+    $process_cpu_interval = sprintf("%d", $total / (@timestamps - 1) );
+    print "Discovered process_cpu_interval=[$process_cpu_interval]\n";
+}
+
+if ($process_cpu_interval == -1) {
+    print STDERR "postprocess-process-cpu: Could not determine interval time!\n";
+    close INPUT;
+    exit 1;
+}
+
+# seek back to the beginning of the file to start over
+seek INPUT, 0, 0;
+
+while (<INPUT>) {
+    my $line = $_;
+    chomp($line);
+
+    if (! $line) {
+	next;
+    }
+
+    if ($line =~ /^Timestamp:/) {
+	($foo, $timestamp) = split(" Time: ", $line);
+	$timestamps[$sample_count] = $timestamp;
+	next;
+    }
+
+    if ($line =~ /^\s*user/) {
+	$sample_count++;
+	$line = <INPUT>;
+	chomp($line);
+
+	($sys_user, $sys_nice, $sys_system, $sys_idle, $sys_iowait, $sys_irq, $sys_softirq, $sys_steal, $sys_guest, $sys_total) = split(" ", $line);
+
+	$total_user += $sys_user;
+	$total_nice += $sys_nice;
+	$total_system += $sys_system;
+	$total_idle += $sys_idle;
+	$total_iowait += $sys_iowait;
+	$total_irq += $sys_irq;
+	$total_softirq += $sys_softirq;
+	$total_steal += $sys_steal;
+	$total_guest += $sys_guest;
+	$total_total += $sys_total;
+
+	next;
+    }
+
+    if ($line =~ /^\s*PID/) {
+	if ($line =~ /lread/) {
+	    $do_task_io = 1;
+	}
+
+	if ($line =~ /minflt\/s/) {
+	    $do_raw = 0;
+	}
+
+	if ($line =~ /guest$/) {
+	    $do_guest_mode = 1;
+	}
+
+	$line = <INPUT>;
+	chomp($line);
+	while ($line) {
+	    my $pid;
+	    my $pid_user;
+	    my $pid_system;
+	    my $pid_guest;
+	    my $pid_total;
+	    my $pid_virt;
+	    my $pid_resident;
+	    my $pid_shared;
+	    my $pid_text;
+	    my $pid_lib;
+	    my $pid_data;
+	    my $pid_minorflt;
+	    my $pid_majorflt;
+	    my $pid_lread;
+	    my $pid_lwrite;
+	    my $pid_rsyscall;
+	    my $pid_wsyscall;
+	    my $pid_pread;
+	    my $pid_pwrite;
+	    my $tcomm;
+
+	    if ($do_task_io) {
+		($pid, $pid_user, $pid_system, $pid_guest, $pid_total, $pid_virt, $pid_resident, $pid_shared,
+		 $pid_text, $pid_lib, $pid_data, $pid_minorflt, $pid_majorflt,
+		 $pid_lread, $pid_lwrite, $pid_rsyscall, $pid_wsyscall, $pid_pread, $pid_pwrite,
+		 $tcomm) = split (" ", $line, 20);
+	    } else {
+		($pid, $pid_user, $pid_system, $pid_guest, $pid_total, $pid_virt, $pid_resident, $pid_shared,
+		 $pid_text, $pid_lib, $pid_data, $pid_minorflt, $pid_majorflt, $tcomm) = split (" ", $line, 14);
+	    }
+
+	    my $hash = 0;
+	    if (@cmd_filters) {
+		foreach my $filter (@cmd_filters) {
+		    if ($tcomm =~ /$filter/) {
+			$hash = $filter;
+			last;
+		    }
+		}
+		if (! $hash) {
+		    $line = <INPUT>;
+		    chomp($line);
+		    next;
+		}
+	    } else {
+		$hash = $pid;
+	    }
+	    if (! exists $pid_stats{$hash}) {
+		$pid_stats{$hash} = {"user" => $pid_user,
+				     "system" => $pid_system,
+				     "guest" => $pid_guest,
+				     "total" => $pid_total,
+				     "virt" => mem_size($pid_virt),
+				     "resident" => mem_size($pid_resident),
+				     "shared" => mem_size($pid_shared),
+				     "text" => mem_size($pid_text),
+				     "lib" => mem_size($pid_lib),
+				     "data" => mem_size($pid_data),
+				     "tcomm" => $tcomm};
+
+		if ($do_raw) {
+		    $pid_stats{$hash}->{"minorflt"} = ($pid_minorflt / $process_cpu_interval);
+		    $pid_stats{$hash}->{"majorflt"} = ($pid_majorflt / $process_cpu_interval);
+		} else {
+		    $pid_stats{$hash}->{"minorflt"} = $pid_minorflt;
+		    $pid_stats{$hash}->{"majorflt"} = $pid_majorflt;
+		}
+
+		if ($do_task_io) {
+		    $pid_stats{$hash}{'lread'} = $pid_lread;
+		    $pid_stats{$hash}{'lwrite'} = $pid_lwrite;
+		    $pid_stats{$hash}{'rsyscall'} = $pid_rsyscall;
+		    $pid_stats{$hash}{'wsyscall'} = $pid_wsyscall;
+		    $pid_stats{$hash}{'pread'} = $pid_pread;
+		    $pid_stats{$hash}{'pwrite'} = $pid_pwrite;
+		}
+
+		$pid_stats{$hash}{'samples'} = ();
+	    } else {
+		$pid_stats{$hash}->{"user"} += $pid_user;
+		$pid_stats{$hash}->{"system"} += $pid_system;
+		$pid_stats{$hash}->{"guest"} += $pid_guest;
+		$pid_stats{$hash}->{"total"} += $pid_total;
+		$pid_stats{$hash}->{"virt"} += mem_size($pid_virt);
+		$pid_stats{$hash}->{"resident"} += mem_size($pid_resident);
+		$pid_stats{$hash}->{"shared"} += mem_size($pid_shared);
+		$pid_stats{$hash}->{"text"} += mem_size($pid_text);
+		$pid_stats{$hash}->{"lib"} += mem_size($pid_lib);
+		$pid_stats{$hash}->{"data"} += mem_size($pid_data);
+
+		if ($do_raw) {
+		    $pid_stats{$hash}->{"minorflt"} += ($pid_minorflt / $process_cpu_interval);
+		    $pid_stats{$hash}->{"majorflt"} += ($pid_majorflt / $process_cpu_interval);
+		} else {
+		    $pid_stats{$hash}->{"minorflt"} += $pid_minorflt;
+		    $pid_stats{$hash}->{"majorflt"} += $pid_majorflt;
+		}
+
+		if ($do_task_io) {
+		    $pid_stats{$hash}{'lread'} += $pid_lread;
+		    $pid_stats{$hash}{'lwrite'} += $pid_lwrite;
+		    $pid_stats{$hash}{'rsyscall'} += $pid_rsyscall;
+		    $pid_stats{$hash}{'wsyscall'} += $pid_wsyscall;
+		    $pid_stats{$hash}{'pread'} += $pid_pread;
+		    $pid_stats{$hash}{'pwrite'} += $pid_pwrite;
+		}
+	    }
+
+	    my $tmp_hash;
+
+	    if ($do_raw) {
+		$tmp_hash = { "user" => ($pid_user * 100 / $sys_total),
+			      "system" => ($pid_system * 100 / $sys_total),
+			      "guest" => ($pid_guest * 100 / $sys_total),
+			      "total" => ($pid_total * 100 / $sys_total),
+			      "virt" => $pid_virt,
+			      "resident" => $pid_resident,
+			      "shared" => $pid_shared,
+			      "text" => $pid_text,
+			      "lib" => $pid_lib,
+			      "minorflt" => ($pid_minorflt / $process_cpu_interval),
+			      "majorflt" => ($pid_majorflt / $process_cpu_interval),
+			      "data" => $pid_data,
+			      "timestamp" => $timestamp};
+	    } else {
+		$tmp_hash = { "user" => $pid_user,
+			      "system" => $pid_system,
+			      "guest" => $pid_guest,
+			      "total" => $pid_total,
+			      "virt" => mem_size($pid_virt),
+			      "resident" => mem_size($pid_resident),
+			      "shared" => mem_size($pid_shared),
+			      "text" => mem_size($pid_text),
+			      "lib" => mem_size($pid_lib),
+			      "minorflt" => $pid_minorflt,
+			      "majorflt" => $pid_majorflt,
+			      "data" => mem_size($pid_data),
+			      "timestamp" => $timestamp};
+	    }
+
+	    if ($do_task_io) {
+		$tmp_hash->{'lread'} = $pid_lread;
+		$tmp_hash->{'lwrite'} = $pid_lwrite;
+		$tmp_hash->{'rsyscall'} = $pid_rsyscall;
+		$tmp_hash->{'wsyscall'} = $pid_wsyscall;
+		$tmp_hash->{'pread'} = $pid_pread;
+		$tmp_hash->{'pwrite'} = $pid_pwrite;
+	    }
+
+	    $pid_stats{$hash}{'samples'}[$sample_count-1] = $tmp_hash;
+
+	    $line = <INPUT>;
+	    chomp($line);
+	}
+    }
+}
+
+if ($sample_count > 0) {
+    print AVERAGED_OUTPUT "Number of samples:  $sample_count\n";
+
+    printf(AVERAGED_OUTPUT "\n%10s\n%10s\n%7s %7s %7s %7s %7s %7s %7s\n",
+           "cpu busy",
+	   "--------",
+	   "total",
+	   "user",
+	   "nice",
+	   "system",
+	   "irq",
+	   "softirq",
+	   "guest");
+    printf(AVERAGED_OUTPUT "%7.2f %7.2f %7.2f %7.2f %7.2f %7.2f %7.2f\n\n",
+	   ($total_user + $total_nice + $total_system + $total_irq + $total_softirq + $total_guest) * 100 / $total_total,
+	   $total_user * 100 / $total_total,
+	   $total_nice * 100 / $total_total,
+	   $total_system * 100 / $total_total,
+	   $total_irq * 100 / $total_total,
+	   $total_softirq * 100 / $total_total,
+	   $total_guest * 100 / $total_total);
+
+    printf(AVERAGED_OUTPUT "\n%10s\n%10s\n%7s %7s %7s %7s %7s %7s %7s\n",
+           "cpu idle",
+	   "--------",
+	   "total",
+	   "idle",
+	   "iowait",
+	   "steal");
+    printf(AVERAGED_OUTPUT "%7.2f %7.2f %7.2f %7.2f\n\n",
+	   ($total_idle + $total_iowait + $total_steal) * 100 / $total_total,
+	   $total_idle * 100 / $total_total,
+	   $total_iowait * 100 / $total_total,
+	   $total_steal * 100 / $total_total);
+
+    printf(AVERAGED_OUTPUT "%6s %5s %6s %5s %5s %8s %8s %8s %8s %8s %8s %8s %8s",
+	   "PID",
+	   "user",
+	   "system",
+	   "guest",
+	   "total",
+	   "virt",
+	   "resident",
+	   "shared",
+	   "text",
+	   "lib",
+	   "data",
+	   "minflt/s",
+	   "majflt/s");
+
+    if ($do_task_io) {
+	printf(AVERAGED_OUTPUT " %8s %8s %8s %8s %8s %8s",
+	       "lread/s",
+	       "lwrite/s",
+	       "r-sysc/s",
+	       "w-sysc/s",
+	       "pread/s",
+	       "pwrite/s");
+    }
+
+    if ($do_guest_mode) {
+	printf(AVERAGED_OUTPUT " %s\n", "guest");
+    } else {
+	printf(AVERAGED_OUTPUT " %s\n", "command");
+    }
+
+    if (@cmd_filters) {
+	foreach my $filter (sort numerically keys %pid_stats) {
+	    if ($do_raw) {
+		printf(AVERAGED_OUTPUT "%5.2f %6.2f %5.2f %5.2f %8.0f %8.0f %8.0f %8.0f %8.0f %8.0f %8.0f %8.0f",
+		       $pid_stats{$filter}->{"user"} * 100 / $total_total,
+		       $pid_stats{$filter}->{"system"} * 100 / $total_total,
+		       $pid_stats{$filter}->{"guest"} * 100 / $total_total,
+		       $pid_stats{$filter}->{"total"} * 100 / $total_total,
+		       $pid_stats{$filter}->{"virt"} / @{$pid_stats{$filter}{'samples'}},
+		       $pid_stats{$filter}->{"resident"} / @{$pid_stats{$filter}{'samples'}},
+		       $pid_stats{$filter}->{"shared"} / @{$pid_stats{$filter}{'samples'}},
+		       $pid_stats{$filter}->{"text"} / @{$pid_stats{$filter}{'samples'}},
+		       $pid_stats{$filter}->{"lib"} / @{$pid_stats{$filter}{'samples'}},
+		       $pid_stats{$filter}->{"data"} / @{$pid_stats{$filter}{'samples'}},
+		       $pid_stats{$filter}->{"minorflt"} / @{$pid_stats{$filter}{'samples'}},
+		       $pid_stats{$filter}->{"majorflt"} / @{$pid_stats{$filter}{'samples'}});
+	    } else {
+		printf(AVERAGED_OUTPUT "%5.2f %6.2f %5.2f %5.2f %8.0f %8.0f %8.0f %8.0f %8.0f %8.0f %8.0f %8.0f",
+		       $pid_stats{$filter}->{"user"} / $total_total,
+		       $pid_stats{$filter}->{"system"} / $total_total,
+		       $pid_stats{$filter}->{"guest"} / $total_total,
+		       $pid_stats{$filter}->{"total"} / $total_total,
+		       $pid_stats{$filter}->{"virt"} / @{$pid_stats{$filter}{'samples'}},
+		       $pid_stats{$filter}->{"resident"} / @{$pid_stats{$filter}{'samples'}},
+		       $pid_stats{$filter}->{"shared"} / @{$pid_stats{$filter}{'samples'}},
+		       $pid_stats{$filter}->{"text"} / @{$pid_stats{$filter}{'samples'}},
+		       $pid_stats{$filter}->{"lib"} / @{$pid_stats{$filter}{'samples'}},
+		       $pid_stats{$filter}->{"data"} / @{$pid_stats{$filter}{'samples'}},
+		       $pid_stats{$filter}->{"minorflt"} / @{$pid_stats{$filter}{'samples'}},
+		       $pid_stats{$filter}->{"majorflt"} / @{$pid_stats{$filter}{'samples'}});
+	    }
+
+	    if ($do_task_io) {
+		printf(AVERAGED_OUTPUT " %8.0f %8.0f %8.0f %8.0f %8.0f %8.0f",
+		       $pid_stats{$filter}->{"lread"} / @{$pid_stats{$filter}{'samples'}},
+		       $pid_stats{$filter}->{"lwrite"} / @{$pid_stats{$filter}{'samples'}},
+		       $pid_stats{$filter}->{"rsyscall"} / @{$pid_stats{$filter}{'samples'}},
+		       $pid_stats{$filter}->{"wsyscall"} / @{$pid_stats{$filter}{'samples'}},
+		       $pid_stats{$filter}->{"pread"} / @{$pid_stats{$filter}{'samples'}},
+		       $pid_stats{$filter}->{"pwrite"} / @{$pid_stats{$filter}{'samples'}});
+	    }
+
+	    printf(AVERAGED_OUTPUT " %s\n", $filter);
+	}
+    } else {
+	foreach my $pid (sort numerically keys %pid_stats) {
+	    if ($do_raw) {
+		printf(AVERAGED_OUTPUT "%6s %5.2f %6.2f %5.2f %5.2f %8.0f %8.0f %8.0f %8.0f %8.0f %8.0f %8.0f %8.0f",
+		       $pid,
+		       $pid_stats{$pid}->{"user"} * 100 / $total_total,
+		       $pid_stats{$pid}->{"system"} * 100 / $total_total,
+		       $pid_stats{$pid}->{"guest"} * 100 / $total_total,
+		       $pid_stats{$pid}->{"total"} * 100 / $total_total,
+		       $pid_stats{$pid}->{"virt"} / @{$pid_stats{$pid}{'samples'}},
+		       $pid_stats{$pid}->{"resident"} / @{$pid_stats{$pid}{'samples'}},
+		       $pid_stats{$pid}->{"shared"} / @{$pid_stats{$pid}{'samples'}},
+		       $pid_stats{$pid}->{"text"} / @{$pid_stats{$pid}{'samples'}},
+		       $pid_stats{$pid}->{"lib"} / @{$pid_stats{$pid}{'samples'}},
+		       $pid_stats{$pid}->{"data"} / @{$pid_stats{$pid}{'samples'}},
+		       $pid_stats{$pid}->{"minorflt"} / @{$pid_stats{$pid}{'samples'}},
+		       $pid_stats{$pid}->{"majorflt"} / @{$pid_stats{$pid}{'samples'}});
+	    } else {
+		printf(AVERAGED_OUTPUT "%6s %5.2f %6.2f %5.2f %5.2f %8.0f %8.0f %8.0f %8.0f %8.0f %8.0f %8.0f %8.0f",
+		       $pid,
+		       $pid_stats{$pid}->{"user"} / $total_total,
+		       $pid_stats{$pid}->{"system"} / $total_total,
+		       $pid_stats{$pid}->{"guest"} / $total_total,
+		       $pid_stats{$pid}->{"total"} / $total_total,
+		       $pid_stats{$pid}->{"virt"} / @{$pid_stats{$pid}{'samples'}},
+		       $pid_stats{$pid}->{"resident"} / @{$pid_stats{$pid}{'samples'}},
+		       $pid_stats{$pid}->{"shared"} / @{$pid_stats{$pid}{'samples'}},
+		       $pid_stats{$pid}->{"text"} / @{$pid_stats{$pid}{'samples'}},
+		       $pid_stats{$pid}->{"lib"} / @{$pid_stats{$pid}{'samples'}},
+		       $pid_stats{$pid}->{"data"} / @{$pid_stats{$pid}{'samples'}},
+		       $pid_stats{$pid}->{"minorflt"} / @{$pid_stats{$pid}{'samples'}},
+		       $pid_stats{$pid}->{"majorflt"} / @{$pid_stats{$pid}{'samples'}});
+	    }
+
+	    if ($do_task_io) {
+		printf(AVERAGED_OUTPUT " %8.0f %8.0f %8.0f %8.0f %8.0f %8.0f",
+		       $pid_stats{$pid}->{"lread"} / @{$pid_stats{$pid}{'samples'}},
+		       $pid_stats{$pid}->{"lwrite"} / @{$pid_stats{$pid}{'samples'}},
+		       $pid_stats{$pid}->{"rsyscall"} / @{$pid_stats{$pid}{'samples'}},
+		       $pid_stats{$pid}->{"wsyscall"} / @{$pid_stats{$pid}{'samples'}},
+		       $pid_stats{$pid}->{"pread"} / @{$pid_stats{$pid}{'samples'}},
+		       $pid_stats{$pid}->{"pwrite"} / @{$pid_stats{$pid}{'samples'}});
+	    }
+
+	    printf(AVERAGED_OUTPUT " %s\n", $pid_stats{$pid}{"tcomm"});
+	}
+    }
+} else {
+    print AVERAGED_OUTPUT "No proc-cpu data found in $ARGV[0]\n";
+}
+
+close AVERAGED_OUTPUT;
+
+my %output_fhs;
+my $label;
+
+my %stat_names = (
+	'user' => 'user ',
+	'system' => 'system ',
+	'guest' => 'guest ',
+	'total' => '',
+	'virt' => 'virt ',
+	'resident' => 'resident ',
+	'shared' => 'shared ',
+	'text' => 'text ',
+	'lib' => 'lib ',
+	'data' => 'data ',
+	'minorflt' => 'minor faults ',
+	'majorflt' => 'major faults ',
+);
+my %task_io_stat_names = (
+	'lread' => 'logical read ',
+	'lwrite' => 'logical writes ',
+	'rsyscall' => 'read syscalls ',
+	'wsyscall' => 'write syscalls ',
+	'pread' => 'physical reads ',
+	'pwrite' => 'physical writes '
+);
+
+foreach my $entry (sort numerically keys %pid_stats) {
+    if (@cmd_filters) {
+	$label = $entry;
+    } else {
+	$label = $pid_stats{$entry}{"tcomm"};
+	$label =~ s/\s*$//;
+    }
+
+    foreach my $stat (keys %stat_names) {
+	open($output_fhs{$entry}{$stat}, ">$output_directory/plot-files/$entry.$stat.plot") || print STDERR "WARNING: Failed to open $output_directory/plot-files/$entry.$stat.plot\n";
+	print { $output_fhs{$entry}{$stat} } "#LABEL:$stat_names{$stat}$label\n";
+    }
+
+    if ($do_task_io) {
+	foreach my $stat (keys %task_io_stat_names) {
+	    open($output_fhs{$entry}{$stat}, ">$output_directory/plot-files/$entry.$stat.plot") || print STDERR "WARNING: Failed to open $output_directory/plot-files/$entry.$stat.plot\n";
+	    print { $output_fhs{$entry}{$stat} } "#LABEL:$task_io_stat_names{$stat}$label\n";
+	}
+    }
+}
+
+foreach my $entry (sort numerically keys %pid_stats) {
+    for (my $i=0; $i<$sample_count; $i++) {
+	my $timestamp_delta = $timestamps[$i] - $timestamps[0];
+	if ($pid_stats{$entry}{'samples'}[$i]) {
+
+	    print { $output_fhs{$entry}{'user'} } $timestamp_delta . ' ' . $pid_stats{$entry}{'samples'}[$i]{'user'} . "\n";
+	    print { $output_fhs{$entry}{'system'} } $timestamp_delta . ' ' . $pid_stats{$entry}{'samples'}[$i]{'system'} . "\n";
+	    print { $output_fhs{$entry}{'guest'} } $timestamp_delta . ' ' . $pid_stats{$entry}{'samples'}[$i]{'guest'} . "\n";
+	    print { $output_fhs{$entry}{'total'} } $timestamp_delta . ' ' . $pid_stats{$entry}{'samples'}[$i]{'total'} . "\n";
+	    print { $output_fhs{$entry}{'virt'} } $timestamp_delta . ' ' . $pid_stats{$entry}{'samples'}[$i]{'virt'} . "\n";
+	    print { $output_fhs{$entry}{'resident'} } $timestamp_delta . ' ' . $pid_stats{$entry}{'samples'}[$i]{'resident'} . "\n";
+	    print { $output_fhs{$entry}{'shared'} } $timestamp_delta . ' ' . $pid_stats{$entry}{'samples'}[$i]{'shared'} . "\n";
+	    print { $output_fhs{$entry}{'text'} } $timestamp_delta . ' ' . $pid_stats{$entry}{'samples'}[$i]{'text'} . "\n";
+	    print { $output_fhs{$entry}{'lib'} } $timestamp_delta . ' ' . $pid_stats{$entry}{'samples'}[$i]{'lib'} . "\n";
+	    print { $output_fhs{$entry}{'data'} } $timestamp_delta . ' ' . $pid_stats{$entry}{'samples'}[$i]{'data'} . "\n";
+	    print { $output_fhs{$entry}{'minorflt'} } $timestamp_delta . ' ' . $pid_stats{$entry}{'samples'}[$i]{'minorflt'} . "\n";
+	    print { $output_fhs{$entry}{'majorflt'} } $timestamp_delta . ' ' . $pid_stats{$entry}{'samples'}[$i]{'majorflt'} . "\n";
+
+	    if ($do_task_io) {
+		print { $output_fhs{$entry}{'lread'} } $timestamp_delta . ' ' . $pid_stats{$entry}{'samples'}[$i]{'lread'} . "\n";
+		print { $output_fhs{$entry}{'lwrite'} } $timestamp_delta . ' ' . $pid_stats{$entry}{'samples'}[$i]{'lwrite'} . "\n";
+		print { $output_fhs{$entry}{'rsyscall'} } $timestamp_delta . ' ' . $pid_stats{$entry}{'samples'}[$i]{'rsyscall'} . "\n";
+		print { $output_fhs{$entry}{'wsyscall'} } $timestamp_delta . ' ' . $pid_stats{$entry}{'samples'}[$i]{'wsyscall'} . "\n";
+		print { $output_fhs{$entry}{'pread'} } $timestamp_delta . ' ' . $pid_stats{$entry}{'samples'}[$i]{'pread'} . "\n";
+		print { $output_fhs{$entry}{'pwrite'} } $timestamp_delta . ' ' . $pid_stats{$entry}{'samples'}[$i]{'pwrite'} . "\n";
+	    }
+	} else {
+	    print { $output_fhs{$entry}{'user'} } "$timestamp_delta 0\n";
+	    print { $output_fhs{$entry}{'system'} } "$timestamp_delta 0\n";
+	    print { $output_fhs{$entry}{'guest'} } "$timestamp_delta 0\n";
+	    print { $output_fhs{$entry}{'total'} } "$timestamp_delta 0\n";
+	    print { $output_fhs{$entry}{'virt'} } "$timestamp_delta 0\n";
+	    print { $output_fhs{$entry}{'resident'} } "$timestamp_delta 0\n";
+	    print { $output_fhs{$entry}{'shared'} } "$timestamp_delta 0\n";
+	    print { $output_fhs{$entry}{'text'} } "$timestamp_delta 0\n";
+	    print { $output_fhs{$entry}{'lib'} } "$timestamp_delta 0\n";
+	    print { $output_fhs{$entry}{'data'} } "$timestamp_delta 0\n";
+	    print { $output_fhs{$entry}{'minorflt'} } "$timestamp_delta 0\n";
+	    print { $output_fhs{$entry}{'majorflt'} } "$timestamp_delta 0\n";
+
+	    if ($do_task_io) {
+		print { $output_fhs{$entry}{'lread'} } "$timestamp_delta 0\n";
+		print { $output_fhs{$entry}{'lwrite'} } "$timestamp_delta 0\n";
+		print { $output_fhs{$entry}{'rsyscall'} } "$timestamp_delta 0\n";
+		print { $output_fhs{$entry}{'wsyscall'} } "$timestamp_delta 0\n";
+		print { $output_fhs{$entry}{'pread'} } "$timestamp_delta 0\n";
+		print { $output_fhs{$entry}{'pwrite'} } "$timestamp_delta 0\n";
+	    }
+	}
+    }
+}
+
+foreach my $entry (sort numerically keys %pid_stats) {
+    close $output_fhs{$entry}{'user'};
+    close $output_fhs{$entry}{'system'};
+    close $output_fhs{$entry}{'guest'};
+    close $output_fhs{$entry}{'total'};
+    close $output_fhs{$entry}{'virt'};
+    close $output_fhs{$entry}{'resident'};
+    close $output_fhs{$entry}{'shared'};
+    close $output_fhs{$entry}{'text'};
+    close $output_fhs{$entry}{'lib'};
+    close $output_fhs{$entry}{'data'};
+    close $output_fhs{$entry}{'minorflt'};
+    close $output_fhs{$entry}{'majorflt'};
+
+    if ($do_task_io) {
+	close $output_fhs{$entry}{'lread'};
+	close $output_fhs{$entry}{'lwrite'};
+	close $output_fhs{$entry}{'rsyscall'};
+	close $output_fhs{$entry}{'wsyscall'};
+	close $output_fhs{$entry}{'pread'};
+	close $output_fhs{$entry}{'pwrite'};
+    }
+}
+
+if (! $ENV{'FORCE_CHART_PL'}) {
+    my $chart_page = new autobench::jschart("Process CPU Charts");
+    if ($ENV{'FORCE_JSCHART_REMOTE_LIBRARY'}) {
+	$chart_page->set_library_remote;
+    }
+
+    if (! $ENV{'FORCE_JSCHART_NO_PACKED_PLOTFILES'}) {
+	$chart_page->enable_packed_plotfiles($output_directory);
+    }
+
+    $chart_page->enable_raw_data_file_links('../');
+
+    my @plots;
+    my @virt_plots;
+    my @resident_plots;
+    my @page_fault_plots;
+    my @lread_plots;
+    my @lwrite_plots;
+    my @rsyscall_plots;
+    my @wsyscall_plots;
+    my @pread_plots;
+    my @pwrite_plots;
+
+    foreach my $entry (sort numerically keys %pid_stats) {
+	push @plots, "$entry.total";
+	push @virt_plots, "$entry.virt";
+	push @resident_plots, "$entry.resident";
+	push @page_fault_plots, ("$entry.minorflt", "$entry.majorflt");
+
+	if ($do_task_io) {
+	    push @lread_plots, "$entry.lread";
+	    push @lwrite_plots, "$entry.lwrite";
+	    push @rsyscall_plots, "$entry.rsyscall";
+	    push @wsyscall_plots, "$entry.wsyscall";
+	    push @pread_plots, "$entry.pread";
+	    push @pwrite_plots, "$entry.pwrite";
+	}
+    }
+
+    $chart_page->add_link('averaged_process_cpu', 'averaged-process-cpu', 'Averaged Data Summary');
+
+    $chart_page->add_section('section_allprocesses', 'All Processes');
+
+    $chart_page->add_chart('totalprocessutilizationranged', 'stacked', 'Total Process Utilization', 'Time (secs.)', 'CPU Utilization');
+    $chart_page->add_axis_range_bound('totalprocessutilizationranged', 'y', 'min', 0);
+    $chart_page->add_axis_range_bound('totalprocessutilizationranged', 'y', 'max', 100);
+    $chart_page->add_plots('totalprocessutilizationranged', @plots);
+    $chart_page->add_raw_data_sources('totalprocessutilizationranged', $input_file);
+
+    $chart_page->add_chart('totalprocessutilization', 'line', 'Process Utilization', 'Time (secs.)', 'CPU Utilization');
+    $chart_page->add_plots('totalprocessutilization', @plots);
+    $chart_page->add_raw_data_sources('totalprocessutilization', $input_file);
+
+    $chart_page->add_chart('allprocessvirtualmemory', 'line', 'Process Virtual Memory', 'Time (secs.)', 'Memory (KB)');
+    $chart_page->add_axis_range_bound('allprocessvirtualmemory', 'y', 'min', 0);
+    $chart_page->add_plots('allprocessvirtualmemory', @virt_plots);
+    $chart_page->add_raw_data_sources('allprocessvirtualmemory', $input_file);
+
+    $chart_page->add_chart('allprocessresidentmemory', 'line', 'Process Resident Memory', 'Time (secs.)', 'Memory (KB)');
+    $chart_page->add_axis_range_bound('allprocessresidentmemory', 'y', 'min', 0);
+    $chart_page->add_plots('allprocessresidentmemory', @resident_plots);
+    $chart_page->add_raw_data_sources('allprocessresidentmemory', $input_file);
+
+    $chart_page->add_chart('totalprocesspagefaults', 'stacked', 'Total Process Page Faults', 'Time (secs.)', 'Page Faults/sec.');
+    $chart_page->add_axis_range_bound('totalprocesspagefaults', 'y', 'min', 0);
+    $chart_page->add_plots('totalprocesspagefaults', @page_fault_plots);
+    $chart_page->add_raw_data_sources('totalprocesspagefaults', $input_file);
+
+    $chart_page->add_chart('allprocesspagefaults', 'line', 'Process Page Faults', 'Time (secs.)', 'Page Faults/sec.');
+    $chart_page->add_axis_range_bound('allprocesspagefaults', 'y', 'min', 0);
+    $chart_page->add_plots('allprocesspagefaults', @page_fault_plots);
+    $chart_page->add_raw_data_sources('allprocesspagefaults', $input_file);
+
+    if ($do_task_io) {
+	$chart_page->add_chart('allprocesslogicalreadio', 'line', 'Process Logical Read IO', 'Time (secs.)', 'Throughput (KBytes/sec.)');
+	$chart_page->add_plots('allprocesslogicalreadio', @lread_plots);
+	$chart_page->add_raw_data_sources('allprocesslogicalreadio', $input_file);
+
+	$chart_page->add_chart('allprocesslogicalwriteio', 'line', 'Process Logical Write IO', 'Time (secs.)', 'Throughput (KBytes/sec.)');
+	$chart_page->add_plots('allprocesslogicalwriteio', @lwrite_plots);
+	$chart_page->add_raw_data_sources('allprocesslogicalwriteio', $input_file);
+
+	$chart_page->add_chart('allprocessphysicalreadio', 'line', 'Process Physical Read IO', 'Time (secs.)', 'Throughput (KBytes/sec.)');
+	$chart_page->add_plots('allprocessphysicalreadio', @pread_plots);
+	$chart_page->add_raw_data_sources('allprocessphysicalreadio', $input_file);
+
+	$chart_page->add_chart('allprocessphysicalwriteio', 'line', 'Process Physical Write IO', 'Time (secs.)', 'Throughput (KBytes/sec.)');
+	$chart_page->add_plots('allprocessphysicalwriteio', @pwrite_plots);
+	$chart_page->add_raw_data_sources('allprocessphysicalwriteio', $input_file);
+
+	$chart_page->add_chart('allprocessreadsyscalls', 'line', 'Process Read Syscalls', 'Time (secs.)', 'System Calls/sec.');
+	$chart_page->add_plots('allprocessreadsyscalls', @rsyscall_plots);
+	$chart_page->add_raw_data_sources('allprocessreadsyscalls', $input_file);
+
+	$chart_page->add_chart('allprocesswritesyscalls', 'line', 'Process Write Syscalls', 'Time (secs.)', 'System Calls/sec.');
+	$chart_page->add_plots('allprocesswritesyscalls', @wsyscall_plots);
+	$chart_page->add_raw_data_sources('allprocesswritesyscalls', $input_file);
+    }
+
+    foreach my $entry (sort numerically keys %pid_stats) {
+	$chart_page->add_section('section_process_' . $entry, 'Process ' . $entry);
+
+	$chart_page->add_chart('processutilization_' . $entry, 'stacked', 'Process Utilization for ' . $entry, 'Time (secs.)', 'CPU Utilization');
+	$chart_page->add_plots('processutilization_' . $entry, ("$entry.user", "$entry.system", "$entry.guest"));
+	$chart_page->add_raw_data_sources('processutilization_' . $entry, $input_file);
+
+	$chart_page->add_chart('processmemory_' . $entry, 'line', 'Memory for ' . $entry, 'Time (secs.)', 'Memory (KB)');
+	$chart_page->add_plots('processmemory_' . $entry, ("$entry.virt", "$entry.resident", "$entry.shared", "$entry.text", "$entry.lib", "$entry.data"));
+	$chart_page->add_raw_data_sources('processmemory_' . $entry, $input_file);
+
+	$chart_page->add_chart('processpagefaults_' . $entry, 'stacked', 'Page Faults for ' . $entry, 'Time (secs.)', 'Page Faults/sec.');
+	$chart_page->add_plots('processpagefaults_' . $entry, ("$entry.minorflt", "$entry.majorflt"));
+	$chart_page->add_raw_data_sources('processpagefaults_' . $entry, $input_file);
+
+	if ($do_task_io) {
+	    $chart_page->add_chart('processlogicalio_' . $entry, 'line', 'Logical IO for ' . $entry, 'Time (secs.)', 'Throughput (KB/sec.)');
+	    $chart_page->add_plots('processlogicalio_' . $entry, ("$entry.lread", "$entry.lwrite"));
+	    $chart_page->add_raw_data_sources('processlogicalio_' . $entry, $input_file);
+
+	    $chart_page->add_chart('processphysicalio_' . $entry, 'line', 'Physical IO for ' . $entry, 'Time (secs.)', 'Throughput (KB/sec.)');
+	    $chart_page->add_plots('processphysicalio_' . $entry, ("$entry.pread", "$entry.pwrite"));
+	    $chart_page->add_raw_data_sources('processphysicalio_' . $entry, $input_file);
+
+	    $chart_page->add_chart('processiosyscalls_' . $entry, 'line', 'IO syscalls for ' . $entry, 'Time (secs.)', 'System Calls/sec.');
+	    $chart_page->add_plots('processiosyscalls_' . $entry, ("$entry.rsyscall", "$entry.wsyscall"));
+	    $chart_page->add_raw_data_sources('processiosyscalls_' . $entry, $input_file);
+	}
+    }
+
+    if (!open(CHART_HTML, ">$output_directory/chart.html")) {
+	print STDERR "postprocess-process-cpu: Could not create chart.html file\n";
+	exit 1;
+    } else {
+	chmod (0644, "$output_directory/chart.html");
+
+	print CHART_HTML $chart_page->dump_page;
+
+	close CHART_HTML;
+
+	if (! $ENV{'FORCE_JSCHART_NO_PACKED_PLOTFILES'}) {
+	    # clean up the non-packed plotfiles
+	    my $deleted_plotfile_count = unlink glob "$output_directory/plot-files/*.plot";
+	    #print "Deleted $deleted_plotfile_count plot files\n";
+	    if (! rmdir "$output_directory/plot-files") {
+		print STDERR "ERROR: Failed to delete $output_directory/plot-files!\n";
+	    }
+	}
+    }
+} else {
+    if (!open(CHART_SCRIPT, ">$output_directory/chart.sh")) {
+	print STDERR "postprocess-process-cpu: Could not create chart.sh file\n";
+	exit 1;
+    } else {
+	chmod (0777, "$output_directory/chart.sh");
+
+	print CHART_SCRIPT "#!/bin/bash\n\n";
+	print CHART_SCRIPT 'DIR=`dirname $0`' . "\n\n";
+	print CHART_SCRIPT 'if [ $# != 2 ]; then' . "\n";
+	print CHART_SCRIPT '  echo "You must specify the path to the chart.pl script and the Chart Directory libraries."' . "\n";
+	print CHART_SCRIPT '  exit 1' . "\n";
+	print CHART_SCRIPT 'fi' . "\n\n";
+	print CHART_SCRIPT 'SCRIPT=$1' . "\n";
+	print CHART_SCRIPT 'LIBRARIES=$2' . "\n\n";
+	print CHART_SCRIPT 'export PERL5LIB=$LIBRARIES' . "\n\n";
+	print CHART_SCRIPT 'pushd $DIR > /dev/null' . "\n\n";
+
+	my $plot_files = "";
+	my $virt_plot_files = "";
+	my $resident_plot_files = "";
+	my $page_fault_plot_files = "";
+	my $lread_plot_files = "";
+	my $lwrite_plot_files = "";
+	my $rsyscall_plot_files = "";
+	my $wsyscall_plot_files = "";
+	my $pread_plot_files = "";
+	my $pwrite_plot_files = "";
+	my $max_length = 0;
+	my $counter = 13;
+
+	if ($do_task_io) {
+	    $max_length = length("" . (keys(%pid_stats) * 6 + $counter - 1) . "");
+	} else {
+	    $max_length = length("" . (keys(%pid_stats) * 3 + $counter - 1) . "");
+	}
+
+	foreach my $entry (sort numerically keys %pid_stats) {
+	    $plot_files .= " plot-files/$entry.total.plot";
+	    $virt_plot_files .= " plot-files/$entry.virt.plot";
+	    $resident_plot_files .= " plot-files/$entry.resident.plot";
+	    $page_fault_plot_files .= " plot-files/$entry.minorflt.plot plot-files/$entry.majorflt.plot";
+
+	    print CHART_SCRIPT '$SCRIPT --table html -s stackedlines --title "' . manual_prepend($counter++, $max_length) . ' process utilization for ' . $entry . '" -x "Time (secs.)" -y "CPU Utilization" plot-files/' . $entry . '.user.plot plot-files/' . $entry . '.system.plot plot-files/' . $entry . '.guest.plot' . "\n";
+	    print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend($counter++, $max_length) . ' memory for ' . $entry . '" -x "Time (secs.)" -y "Memory (KB)" plot-files/' . $entry . '.virt.plot plot-files/' . $entry . '.resident.plot plot-files/' . $entry . '.shared.plot plot-files/' . $entry . '.text.plot plot-files/' . $entry . '.lib.plot plot-files/' . $entry . '.data.plot' . "\n";
+	    print CHART_SCRIPT '$SCRIPT --table html -s stackedlines --title "' . manual_prepend($counter++, $max_length) . ' page faults for ' . $entry . '" -x "Time (secs.)" -y "Page Faults/sec" plot-files/' . $entry . '.minorflt.plot plot-files/' . $entry . '.majorflt.plot' . "\n";
+
+	    if ($do_task_io) {
+		$lread_plot_files .= " plot-files/$entry.lread.plot";
+		$lwrite_plot_files .= " plot-files/$entry.lwrite.plot";
+		$rsyscall_plot_files .= " plot-files/$entry.rsyscall.plot";
+		$wsyscall_plot_files .= " plot-files/$entry.wsyscall.plot";
+		$pread_plot_files .= " plot-files/$entry.pread.plot";
+		$pwrite_plot_files .= " plot-files/$entry.pwrite.plot";
+
+		print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend($counter++, $max_length) . ' logical io for ' . $entry . '" -x "Time (secs.)" -y "Throughput (KB/sec)" --legend-position bottom plot-files/' . $entry . '.lread.plot plot-files/' . $entry . '.lwrite.plot' . "\n";
+		print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend($counter++, $max_length) . ' physical io for ' . $entry . '" -x "Time (secs.)" -y "Throughput (KB/sec)" --legend-position bottom plot-files/' . $entry . '.pread.plot plot-files/' . $entry . '.pwrite.plot' . "\n";
+		print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend($counter++, $max_length) . ' io syscalls for ' . $entry . '" -x "Time (secs.)" -y "System Calls/sec" --legend-position bottom plot-files/' . $entry . '.rsyscall.plot plot-files/' . $entry . '.wsyscall.plot' . "\n";
+	    }
+	}
+
+	print CHART_SCRIPT "\n" . '$SCRIPT --table html -s stackedlines --title "' . manual_prepend(1, $max_length) . ' total process utilization" -x "Time (secs.)" -y "CPU Utilization" --y-range=0:100 ' . $plot_files . "\n";
+	print CHART_SCRIPT "\n" . '$SCRIPT --table html -s lines --title "' . manual_prepend(2, $max_length) . ' process utilization" -x "Time (secs.)" -y "CPU Utilization" ' . $plot_files . "\n\n";
+	print CHART_SCRIPT "\n" . '$SCRIPT --table html -s lines --title "' . manual_prepend(3, $max_length) . ' process virtual memory" -x "Time (secs.)" -y "Memory (KB)" --y-range=0:* ' . $virt_plot_files . "\n";
+	print CHART_SCRIPT "\n" . '$SCRIPT --table html -s lines --title "' . manual_prepend(4, $max_length) . ' process resident memory" -x "Time (secs.)" -y "Memory (KB)" --y-range=0:* ' . $resident_plot_files . "\n\n";
+	print CHART_SCRIPT "\n" . '$SCRIPT --table html -s stackedlines --title "' . manual_prepend(5, $max_length) . ' total process page faults" -x "Time (secs.)" -y "Page Faults/sec" --y-range=0:* ' . $page_fault_plot_files . "\n\n";
+	print CHART_SCRIPT "\n" . '$SCRIPT --table html -s lines --title "' . manual_prepend(6, $max_length) . ' process page faults" -x "Time (secs.)" -y "Page Faults/sec" --y-range=0:* ' . $page_fault_plot_files . "\n\n";
+
+	if ($do_task_io) {
+	    print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(7, $max_length) . ' process logical read io" -x "Time (secs.)" -y "Throughput (KB/sec)" ' . $lread_plot_files . "\n";
+	    print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(8, $max_length) . ' process logical write io" -x "Time (secs.)" -y "Throughput (KB/sec)" ' . $lwrite_plot_files . "\n";
+	    print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(9, $max_length) . ' process physical read io" -x "Time (secs.)" -y "Throughput (KB/sec)" ' . $pread_plot_files . "\n";
+	    print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(10, $max_length) . ' process physical write io" -x "Time (secs.)" -y "Throughput (KB/sec)" ' . $pwrite_plot_files . "\n";
+	    print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(11, $max_length) . ' process read syscalls" -x "Time (secs.)" -y "System Calls/sec" ' . $rsyscall_plot_files . "\n";
+	    print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend(12, $max_length) . ' process write syscalls" -x "Time (secs.)" -y "System Calls/sec" ' . $wsyscall_plot_files . "\n";
+	}
+
+	print CHART_SCRIPT 'echo -e "<html>\n<head>\n<title>Process CPU Charts</title>\n</head>\n<body>\n" > chart.html' . "\n";
+
+	print CHART_SCRIPT 'if [ -e averaged-process-cpu ]; then' . "\n";
+	print CHART_SCRIPT '  echo -e "<a href=\'averaged-process-cpu\'>Averaged Data summary</a><br/><br/>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT 'fi' . "\n";
+
+	print CHART_SCRIPT 'for i in `ls -1 *.png`; do' . "\n";
+	print CHART_SCRIPT '  echo -e "<table>\n<tr valign=\'top\'>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  echo -e "<td><img src=\'$i\'></td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  html_file=`echo $i | sed -e "s/png/html/"`' . "\n";
+	print CHART_SCRIPT '  if [ -e $html_file ]; then' . "\n";
+	print CHART_SCRIPT '    echo -e "<td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '    cat $html_file >> chart.html' . "\n";
+	print CHART_SCRIPT '    echo -e "</td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  fi' . "\n";
+	print CHART_SCRIPT '  echo -e "</tr>\n</table>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT 'done' . "\n\n";
+
+	print CHART_SCRIPT 'echo -e "</body>\n</html>\n" >> chart.html' . "\n";
+
+	close CHART_SCRIPT;
+    }
+}

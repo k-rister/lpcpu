@@ -1,0 +1,686 @@
+#! /usr/bin/perl
+
+#
+# LPCPU (Linux Performance Customer Profiler Utility): ./tools/proc-cpu
+#
+# (C) Copyright IBM Corp. 2016
+#
+# This file is subject to the terms and conditions of the Eclipse
+# Public License.  See the file LICENSE.TXT in the main directory of the
+# distribution for more details.
+#
+
+
+# Display the CPU and Memory utilization per process.
+# System CPU statistics are gleaned from /proc/stat.
+# Process CPU statistics are gleaned from /proc/<pid>/stat.
+# Process Memory statistics are gleaned from /proc/<pid>/statm.
+# See usage() below for the description of the options.
+
+use strict;
+use File::Basename;
+use Getopt::Long;
+use IO::Handle;
+#use Data::Dumper;
+use POSIX;
+
+# disable output buffering for STDOUT
+$|++;
+
+# Set default parameters.
+my $count = -1;		# Run forever
+my $delay = 5;
+my $display_idle = 0;
+my $display_raw = 0;
+my @pids;
+my $pids_given = 0;
+my $cmd_filter = 0;
+my @cmd_filters;
+my $output_filter_file = 0;
+my $do_help =0;
+my $term_limits = 0;
+my $do_task_io = 0;
+my $qemu_guest_mode = 0;
+
+# get the system page size in KB
+my $page_size = sysconf(_SC_PAGESIZE) / 1024;
+
+sub usage() {
+	my $prog_name = basename($0);
+	chomp $prog_name;
+	print "\nSyntax: $prog_name [options]\n";
+	print "Options:\n";
+	print "  -d <delay> time in seconds to delay between getting statistics; default is $delay.\n";
+	print "  -n <count> number of iterations, -1 means forever; default is $count.\n";
+	print "  -i display statistics for idle processes, too.\n";
+	print "  -r display raw data instead of percentages.\n";
+	print "  -p <PID> [-p <PID> ...] display usages only for these PIDS; default is all PIDs.\n";
+	print "  -c <command-filter> regexp to apply to the command line to filter the output.\n";
+	print "  -f <file> file containing list of output filters to apply to the command string.\n";
+	print "  --qemu-guest-mode Display guest names (if possible) instead of full QEMU command.\n";
+	print "  -h display this help text.\n";
+}
+
+# Use the setting and resetting of signal handlers to implement a
+# critical section around the print of the output so that all the
+# output for a given sample gets printed. 
+my $quit = 0;
+my $orig_sig_int  = $SIG{INT};
+my $orig_sig_quit = $SIG{QUIT};
+my $orig_sig_abrt = $SIG{ABRT};
+my $orig_sig_term = $SIG{TERM};
+
+sub sig_handler {
+	my $signame = shift;
+	$quit = 1;
+}
+
+sub crit_sec_start() {
+	$SIG{INT}  = \&sig_handler;
+	$SIG{QUIT} = \&sig_handler;
+	$SIG{ABRT} = \&sig_handler;
+	$SIG{TERM} = \&sig_handler;
+}
+
+sub crit_sec_end() {
+	$SIG{INT}  = $orig_sig_int;
+	$SIG{QUIT} = $orig_sig_quit;
+	$SIG{ABRT} = $orig_sig_abrt;
+	$SIG{TERM} = $orig_sig_term;
+}
+
+sub memory_pages_to_kb {
+    my $input = shift;
+
+    return $input * $page_size;
+}
+
+# take input in KB and pretty print it with units, converting if necessary
+sub pretty_print_memory_size {
+	my $input = shift;
+	my $output = $input;
+
+	
+	if ($output >= (1024 * 1024 * 1024)) {
+	    $output = sprintf("%5.1fTB", $input / (1024 * 1024));
+	} elsif ($output >= (1024 * 1024)) {
+	    $output = sprintf("%5.1fGB", $input / (1024 * 1024));
+	} elsif ($output >= 1024) {
+	    $output = sprintf("%5.1fMB", $input / 1024);
+	} else {
+	    $output = sprintf("%5.1fKB", $input);
+	}
+
+	return $output;
+}
+
+# Parse parameters.
+my %opt_hash = ("d" => \$delay,
+		"n" => \$count,
+		"i" => \$display_idle,
+		"r" => \$display_raw,
+		"p" => \@pids,
+		"c" => \$cmd_filter,
+		"f" => \$output_filter_file,
+		"qemu-guest-mode" => \$qemu_guest_mode,
+		"h" => \$do_help);
+
+GetOptions(\%opt_hash, "d=i", "n=i", "i", "r", "p=s@", "c=s", "f=s", "qemu-guest-mode", "h");
+
+if ($do_help) {
+	usage();
+	exit;
+}
+
+if ( -t STDOUT ) {
+	require 'sys/ioctl.ph';
+	if (defined &TIOCGWINSZ) {
+		if (open(TTY, "+</dev/tty")) {
+			$term_limits = 1;
+		}
+	}
+}
+
+sub my_printf {
+	my $format = shift;
+	my $winsize = '';
+	if ($term_limits) {
+		if (ioctl(TTY, &TIOCGWINSZ, $winsize)) {
+			my $row;
+			my $col;
+			my $xpixel;
+			my $ypixel;
+			my $newline = "";
+			($row, $col, $xpixel, $ypixel) = unpack('S4', $winsize);
+			my $buffer = sprintf $format, @_;
+			if ($col < length($buffer)) {
+			    $newline = "\n";
+			}
+			$buffer = substr($buffer, 0, $col);
+			print $buffer;
+			print $newline;
+		} else {
+			printf $format, @_;
+		}
+	} else {
+		printf $format, @_;
+	}
+}
+
+sub read_task_io {
+    my $pid = shift;
+    my $hash = shift;
+
+    open(PID_IO, "</proc/$pid/io");
+    my @io_data = <PID_IO>;
+    close PID_IO;
+
+    foreach my $line (@io_data) {
+	if ($line =~ /^rchar:/) {
+	    $line =~ m/^rchar: (.*)/;
+	    $hash->{'logical-read-kbytes'} = $1 / 1024;
+	} elsif ($line =~ /^wchar:/) {
+	    $line =~ m/^wchar: (.*)/;
+	    $hash->{'logical-write-kbytes'} = $1 / 1024;
+	} elsif ($line =~ /^syscr:/) {
+	    $line =~ m/^syscr: (.*)/;
+	    $hash->{'read-syscalls'} = $1;
+	} elsif ($line =~ /^syscw:/) {
+	    $line =~ m/^syscw: (.*)/;
+	    $hash->{'write-syscalls'} = $1;
+	} elsif ($line =~ /^read_bytes:/) {
+	    $line =~ m/^read_bytes: (.*)/;
+	    $hash->{'physical-read-kbytes'} = $1 / 1024;
+	} elsif ($line =~ /^write_bytes:/) {
+	    $line =~ m/^write_bytes: (.*)/;
+	    $hash->{'physical-write-kbytes'} = $1 / 1024;
+	} elsif ($line =~ /^cancelled_write_bytes:/) {
+	    $line =~ m/^cancelled_write_bytes: (.*)/;
+	    $hash->{'cancelled-write-kbytes'} = $1 / 1024;
+	}
+    }
+}
+
+sub apply_output_filter {
+    my $cmd = shift;
+    my $filters = shift;
+
+    foreach my $filter (@{$filters}) {
+	eval "\$cmd =~ $filter";
+    }
+
+    return $cmd;
+}
+
+# Set autoflush on the output handle;
+$| = 1;
+
+# Save a flag that says that the user specified which PIDs to monitor.
+# Can't check if the array is empty because we populate the array
+# with the current PIDs if no PIDs are specified by the user.
+if (@pids) {
+	$pids_given = 1;
+}
+
+open(PROC_STAT, "</proc/stat") or die "Can't get system stats: $!";
+opendir(PROC, "/proc") or die "Can't access /proc: $!";
+
+if (open(TASK_IO, "</proc/self/io")) {
+    # per process task i/o accounting is supported
+    $do_task_io = 1;
+    close TASK_IO;
+}
+
+my @output_filters;
+my @sys_prev;
+my @sys_curr;
+my %pids_prev;
+my %pids_curr;
+
+if ($output_filter_file) {
+    open(FILTER_FILE, "<$output_filter_file") or die "Can't open output filter file: $!";
+    while (<FILTER_FILE>) {
+	chomp($_);
+	my_printf("Adding output filter %s from %s\n", $_, $output_filter_file);
+	push @output_filters, $_;
+    }
+    close FILTER_FILE;
+}
+
+# Get the current statistics into the "prev" variables so that they are
+# ready to go for the first iteration.
+if (! $pids_given) {
+	@pids = grep /^[1-9]/, readdir PROC;
+}
+
+@sys_prev = split(/\s+/, <PROC_STAT>);
+
+# an array is used to account for multiple filters, so move the filter into the array
+if ($cmd_filter) {
+    $cmd_filters[0] = $cmd_filter;
+}
+
+my $cmd_header = "command";
+if ($qemu_guest_mode) {
+    $cmd_header = "guest";
+
+    # set a default set of filters when QEMU guest mode is in use if a
+    # filter was not supplied on the CLI, different distributions and
+    # architectures use various names for the QEMU binary that must be
+    # checked for
+    if (! $cmd_filter) {
+	$cmd_filters[0] = '[a-b/]qemu-kvm';
+	$cmd_filters[1] = '[a-b/]qemu-system-';
+	$cmd_filters[2] = '[a-b/]kvm\s';
+    }
+}
+
+foreach my $pid (@pids) {
+	if ($$ == $pid) {
+		next;
+	}
+
+	open(PID_CMDLINE, "</proc/$pid/cmdline");
+	my $cmd = <PID_CMDLINE>;
+	close(PID_CMDLINE);
+	$cmd =~ s/\0/ /g;
+	
+	open(PID_STAT, "</proc/$pid/stat");
+	my @stat_fields = split(/\s+/, <PID_STAT>);
+	close(PID_STAT);
+
+	open(PID_STATM, "</proc/$pid/statm");
+	my @statm_fields = split(/\s+/, <PID_STATM>);
+	close(PID_STATM);
+
+	# Kernel threads don't have an exe.  Use the tcomm fiels in /proc/<pid>/stat.
+	if (! $cmd) {
+		$cmd = $stat_fields[1];
+	}
+
+	if (@cmd_filters) {
+	    my $filter_hit = 0;
+	    foreach $cmd_filter (@cmd_filters) {
+		if ($cmd =~ /$cmd_filter/) {
+		    $filter_hit = 1;
+		}
+	    }
+	    if (! $filter_hit) {
+		next;
+	    }
+	}
+
+	if ($output_filter_file) {
+	    $cmd = apply_output_filter($cmd, \@output_filters);
+	}
+
+	$pids_prev{$pid} = { 'cmd' => $cmd,
+			     'utime' => $stat_fields[13],
+			     'stime' => $stat_fields[14],
+			     'gtime' => $stat_fields[42],
+			     'minor_page_faults' => $stat_fields[9],
+			     'major_page_faults' => $stat_fields[11],
+			     'size' => memory_pages_to_kb($statm_fields[0]),
+			     'resident' => memory_pages_to_kb($statm_fields[1]),
+			     'shared' => memory_pages_to_kb($statm_fields[2]),
+			     'text' => memory_pages_to_kb($statm_fields[3]),
+			     'lib' => memory_pages_to_kb($statm_fields[4]),
+			     'data' => memory_pages_to_kb($statm_fields[5]) };
+
+	if ($do_task_io) {
+	    read_task_io($pid, \%{$pids_prev{$pid}});
+	}
+}
+
+# Reset directories and files back to the beginning for the next iteration.
+if (! $pids_given) {
+	rewinddir(PROC);
+}
+seek(PROC_STAT, 0, 0);	# Reset to beginning of file for next read.
+
+# Main loop
+while ((! $quit) && ($count != 0)) {
+	sleep $delay;
+
+	# Do all the data gathering as quickly as possible so that there are
+	# few discrepencies.  Do calculations and formatting later.
+	if (! $pids_given) {
+		@pids = grep /^[1-9]/, readdir PROC;
+	}
+	@sys_curr = split(/\s+/, <PROC_STAT>);
+
+	my $pid;
+	foreach $pid (@pids) {
+		if ($$ == $pid) {
+			next;
+		}
+
+		open(PID_CMDLINE, "</proc/$pid/cmdline");
+		my $cmd = <PID_CMDLINE>;
+		close(PID_CMDLINE);
+		$cmd =~ s/\0/ /g;
+	
+		open(PID_STAT, "</proc/$pid/stat");
+		my @stat_fields = split(/\s+/, <PID_STAT>);
+		close(PID_STAT);
+
+		open(PID_STATM, "</proc/$pid/statm");
+		my @statm_fields = split(/\s+/, <PID_STATM>);
+		close(PID_STATM);
+
+		# Kernel threads don't have an exe.  Use the tcomm fiels in /proc/<pid>/stat.
+		if (! $cmd) {
+			$cmd = $stat_fields[1];
+		}
+
+		if (@cmd_filters) {
+		    my $filter_hit = 0;
+		    foreach $cmd_filter (@cmd_filters) {
+			if ($cmd =~ /$cmd_filter/) {
+			    $filter_hit = 1;
+			}
+		    }
+		    if (! $filter_hit) {
+			next;
+		    }
+		}
+
+		if ($qemu_guest_mode) {
+		    if ($cmd =~ /-name\s[a-zA-Z0-9-_]+\s/) {
+			# example: -name fresno
+			$cmd =~ m/-name\s([a-zA-Z0-9-_]+)\s/;
+			$cmd = $1;
+		    } elsif ($cmd =~ /-name\s([a-zA-Z0-9-_]+),process=qemu:[a-zA-Z0-9-_]+\s/) {
+			# example: -name fresno,process=qemu:fresno
+			$cmd =~ m/-name\s([a-zA-Z0-9-_]+),process=qemu:[a-zA-Z0-9-_]+\s/;
+			$cmd = $1;
+		    } elsif ($cmd =~ /-uuid\s[a-zA-Z0-9-]+\s/) {
+			# example: -uuid 8a2d4e21-2e1b-f00d-9cf3-5d6a060f8355
+			$cmd =~ m/-uuid\s([a-zA-Z0-9-]+)\s/;
+			$cmd = $1;
+		    }
+		}
+
+		if ($output_filter_file) {
+		    $cmd = apply_output_filter($cmd, \@output_filters);
+		}
+
+		$pids_curr{$pid} = { 'cmd' => $cmd,
+				     'utime' => $stat_fields[13],
+				     'stime' => $stat_fields[14],
+				     'gtime' => $stat_fields[42],
+				     'minor_page_faults' => $stat_fields[9],
+				     'major_page_faults' => $stat_fields[11],
+				     'size' => memory_pages_to_kb($statm_fields[0]),
+				     'resident' => memory_pages_to_kb($statm_fields[1]),
+				     'shared' => memory_pages_to_kb($statm_fields[2]),
+				     'text' => memory_pages_to_kb($statm_fields[3]),
+				     'lib' => memory_pages_to_kb($statm_fields[4]),
+				     'data' => memory_pages_to_kb($statm_fields[5]) };
+
+		if ($do_task_io) {
+		    read_task_io($pid, \%{$pids_curr{$pid}});
+		}
+	}
+
+	# Reset for the next reads.
+	if (! $pids_given) {
+		rewinddir(PROC);
+	}
+	seek(PROC_STAT, 0, 0);	# Reset to beginning of file for next read.
+
+	# Print system CPU statistics.
+	my @sys_delta;
+	my $sys_total = 0;
+	for(my $i = 1; $i < @sys_curr; $i++) {
+		$sys_delta[$i] = $sys_curr[$i] - $sys_prev[$i];
+		$sys_total += $sys_delta[$i];
+	}
+        $sys_total -= $sys_delta[9];
+
+	crit_sec_start();
+
+	my $timestamp = time();
+	my @timestamp_array = localtime($timestamp);
+	$timestamp_array[4]++;
+	$timestamp_array[5] += 1900;
+	my_printf("\nTimestamp: %s.%s.%02d-%s:%s:%s UNIX Time: %s\n\n",
+		  $timestamp_array[5],
+		  $timestamp_array[4],
+		  $timestamp_array[3],
+		  $timestamp_array[2],
+		  $timestamp_array[1],
+		  $timestamp_array[0],
+		  $timestamp);
+
+	my_printf("%5s %5s %6s %6s %6s %5s %7s %5s %5s %6s\n",
+		"user",
+		"nice",
+		"system",
+		"idle",
+		"iowait",
+		"irq",
+		"softirq",
+		"steal",
+		"guest",
+		"total");
+	if ($display_raw) {
+		my_printf("%5d %5d %6d %6d %6d %5d %7d %5d %5d %6d\n\n",
+			($sys_delta[1]-$sys_delta[9]),
+			$sys_delta[2],
+			$sys_delta[3],
+			$sys_delta[4],
+			$sys_delta[5],
+			$sys_delta[6],
+			$sys_delta[7],
+			$sys_delta[8],
+			$sys_delta[9],
+			$sys_total);
+	} else {
+		my_printf("%5.2f %5.2f %6.2f %6.2f %6.2f %5.2f %7.2f %5.2f %5.2f %6.2f\n\n",
+			($sys_delta[1] - $sys_delta[9]) * 100 / $sys_total,
+			$sys_delta[2] * 100 / $sys_total,
+			$sys_delta[3] * 100 / $sys_total,
+			$sys_delta[4] * 100 / $sys_total,
+			$sys_delta[5] * 100 / $sys_total,
+			$sys_delta[6] * 100 / $sys_total,
+			$sys_delta[7] * 100 / $sys_total,
+			$sys_delta[8] * 100 / $sys_total,
+			$sys_delta[9] * 100 / $sys_total,
+			100);
+	}
+
+	# Print process CPU statistics.
+	if ($do_task_io) {
+	    if ($display_raw) {
+		my_printf("%6s %5s %6s %5s %5s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %s\n",
+			  "PID",
+			  "user",
+			  "system",
+			  "guest",
+			  "total",
+			  "virt",
+			  "resident",
+			  "shared",
+			  "text",
+			  "lib",
+			  "data",
+			  "minflt",
+			  "majflt",
+			  "lread/s",
+			  "lwrite/s",
+			  "r-sysc/s",
+			  "w-sysc/s",
+			  "pread/s",
+			  "pwrite/s",
+			  $cmd_header);
+	    } else {
+		my_printf("%6s %5s %6s %5s %5s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %s\n",
+			  "PID",
+			  "user",
+			  "system",
+			  "guest",
+			  "total",
+			  "virt",
+			  "resident",
+			  "shared",
+			  "text",
+			  "lib",
+			  "data",
+			  "minflt/s",
+			  "majflt/s",
+			  "lread/s",
+			  "lwrite/s",
+			  "r-sysc/s",
+			  "w-sysc/s",
+			  "pread/s",
+			  "pwrite/s",
+			  $cmd_header);
+	    }
+	} else {
+	    if ($display_raw) {
+		my_printf("%6s %5s %6s %5s %5s %8s %8s %8s %8s %8s %8s %8s %8s %s\n",
+			  "PID",
+			  "user",
+			  "system",
+			  "guest",
+			  "total",
+			  "virt",
+			  "resident",
+			  "shared",
+			  "text",
+			  "lib",
+			  "data",
+			  "minflt",
+			  "majflt",
+			  $cmd_header);
+	    } else {
+		my_printf("%6s %5s %6s %5s %5s %8s %8s %8s %8s %8s %8s %8s %8s %s\n",
+			  "PID",
+			  "user",
+			  "system",
+			  "guest",
+			  "total",
+			  "virt",
+			  "resident",
+			  "shared",
+			  "text",
+			  "lib",
+			  "data",
+			  "minflt/s",
+			  "majflt/s",
+			  $cmd_header);
+	    }
+	}
+	foreach $pid (sort { $a <=> $b } keys %pids_curr) {
+		if (! $display_idle && ($pids_curr{$pid}{"utime"} == $pids_prev{$pid}{"utime"}) && ($pids_curr{$pid}{"stime"} == $pids_prev{$pid}{"stime"})) {
+			next;
+		}
+
+		#print Dumper \$pids_curr{$pid};
+
+		# correct for instances where the guest time counter has advanced since the user time counter was read
+		my $user_guest_delta_check = ($pids_curr{$pid}{"utime"} - $pids_prev{$pid}{"utime"}) - ($pids_curr{$pid}{"gtime"} - $pids_prev{$pid}{"gtime"});
+		# if we have < 0, we need to add the deficit back to user time to offset the racy read
+		if ($user_guest_delta_check < 0) {
+		    # use -= to offset the negative value (double negative)
+		    $pids_curr{$pid}{"utime"} -= $user_guest_delta_check;
+		}
+
+		if ($do_task_io) {
+		    if ($display_raw) {
+			my_printf("%6s %5d %6d %5d %5d %8s %8s %8s %8s %8s %8s %8s %8s %8.1f %8.1f %8.1f %8.1f %8.1f %8.1f %s\n",
+				  $pid,
+				  ($pids_curr{$pid}{"utime"} - $pids_prev{$pid}{"utime"}) - ($pids_curr{$pid}{"gtime"} - $pids_prev{$pid}{"gtime"}),
+				  $pids_curr{$pid}{"stime"} - $pids_prev{$pid}{"stime"},
+				  $pids_curr{$pid}{"gtime"} - $pids_prev{$pid}{"gtime"},
+				  $pids_curr{$pid}{"utime"} - $pids_prev{$pid}{"utime"} + $pids_curr{$pid}{"stime"} - $pids_prev{$pid}{"stime"},
+				  $pids_curr{$pid}{"size"},
+				  $pids_curr{$pid}{"resident"},
+				  $pids_curr{$pid}{"shared"},
+				  $pids_curr{$pid}{"text"},
+				  $pids_curr{$pid}{"lib"},
+				  $pids_curr{$pid}{"data"},
+				  $pids_curr{$pid}{"minor_page_faults"} - $pids_prev{$pid}{"minor_page_faults"},
+				  $pids_curr{$pid}{"major_page_faults"} - $pids_prev{$pid}{"major_page_faults"},
+				  ($pids_curr{$pid}{"logical-read-kbytes"} - $pids_prev{$pid}{"logical-read-kbytes"}) / $delay,
+				  ($pids_curr{$pid}{"logical-write-kbytes"} - $pids_prev{$pid}{"logical-write-kbytes"}) / $delay,
+				  ($pids_curr{$pid}{"read-syscalls"} - $pids_prev{$pid}{"read-syscalls"}) / $delay,
+				  ($pids_curr{$pid}{"write-syscalls"} - $pids_prev{$pid}{"write-syscalls"}) / $delay,
+				  ($pids_curr{$pid}{"physical-read-kbytes"} - $pids_prev{$pid}{"physical-read-kbytes"}) / $delay,
+				  ($pids_curr{$pid}{"physical-write-kbytes"} - $pids_prev{$pid}{"physical-write-kbytes"}) / $delay,
+				  $pids_curr{$pid}{"cmd"});
+		    } else {
+			my_printf("%6s %5.2f %6.2f %5.2f %5.2f %8s %8s %8s %8s %8s %8s %8.1f %8.1f %8.1f %8.1f %8.1f %8.1f %8.1f %8.1f %s\n",
+				  $pid,
+				  (($pids_curr{$pid}{"utime"} - $pids_prev{$pid}{"utime"}) - ($pids_curr{$pid}{"gtime"} - $pids_prev{$pid}{"gtime"})) * 100 / $sys_total,
+				  ($pids_curr{$pid}{"stime"} - $pids_prev{$pid}{"stime"}) * 100 / $sys_total,
+				  ($pids_curr{$pid}{"gtime"} - $pids_prev{$pid}{"gtime"}) * 100 / $sys_total,
+				  ($pids_curr{$pid}{"utime"} - $pids_prev{$pid}{"utime"} + $pids_curr{$pid}{"stime"} - $pids_prev{$pid}{"stime"})  * 100 / $sys_total,
+				  pretty_print_memory_size($pids_curr{$pid}{"size"}),
+				  pretty_print_memory_size($pids_curr{$pid}{"resident"}),
+				  pretty_print_memory_size($pids_curr{$pid}{"shared"}),
+				  pretty_print_memory_size($pids_curr{$pid}{"text"}),
+				  pretty_print_memory_size($pids_curr{$pid}{"lib"}),
+				  pretty_print_memory_size($pids_curr{$pid}{"data"}),
+				  ($pids_curr{$pid}{"minor_page_faults"} - $pids_prev{$pid}{"minor_page_faults"}) / $delay,
+				  ($pids_curr{$pid}{"major_page_faults"} - $pids_prev{$pid}{"major_page_faults"}) / $delay,
+				  ($pids_curr{$pid}{"logical-read-kbytes"} - $pids_prev{$pid}{"logical-read-kbytes"}) / $delay,
+				  ($pids_curr{$pid}{"logical-write-kbytes"} - $pids_prev{$pid}{"logical-write-kbytes"}) / $delay,
+				  ($pids_curr{$pid}{"read-syscalls"} - $pids_prev{$pid}{"read-syscalls"}) / $delay,
+				  ($pids_curr{$pid}{"write-syscalls"} - $pids_prev{$pid}{"write-syscalls"}) / $delay,
+				  ($pids_curr{$pid}{"physical-read-kbytes"} - $pids_prev{$pid}{"physical-read-kbytes"}) / $delay,
+				  ($pids_curr{$pid}{"physical-write-kbytes"} - $pids_prev{$pid}{"physical-write-kbytes"}) / $delay,
+				  $pids_curr{$pid}{"cmd"});
+		    }
+		} else {
+		    if ($display_raw) {
+			my_printf("%6s %5d %6d %5d %5d %8s %8s %8s %8s %8s %8s %8s %8s %s\n",
+				  $pid,
+				  ($pids_curr{$pid}{"utime"} - $pids_prev{$pid}{"utime"}) - ($pids_curr{$pid}{"gtime"} - $pids_prev{$pid}{"gtime"}),
+				  $pids_curr{$pid}{"stime"} - $pids_prev{$pid}{"stime"},
+				  $pids_curr{$pid}{"gtime"} - $pids_prev{$pid}{"gtime"},
+				  $pids_curr{$pid}{"utime"} - $pids_prev{$pid}{"utime"} + $pids_curr{$pid}{"stime"} - $pids_prev{$pid}{"stime"},
+				  $pids_curr{$pid}{"size"},
+				  $pids_curr{$pid}{"resident"},
+				  $pids_curr{$pid}{"shared"},
+				  $pids_curr{$pid}{"text"},
+				  $pids_curr{$pid}{"lib"},
+				  $pids_curr{$pid}{"data"},
+				  $pids_curr{$pid}{"minor_page_faults"} - $pids_prev{$pid}{"minor_page_faults"},
+				  $pids_curr{$pid}{"major_page_faults"} - $pids_prev{$pid}{"major_page_faults"},
+				  $pids_curr{$pid}{"cmd"});
+		    } else {
+			my_printf("%6s %5.2f %6.2f %5.2f %5.2f %8s %8s %8s %8s %8s %8s %8.1f %8.1f %s\n",
+				  $pid,
+				  (($pids_curr{$pid}{"utime"} - $pids_prev{$pid}{"utime"}) - ($pids_curr{$pid}{"gtime"} - $pids_prev{$pid}{"gtime"})) * 100 / $sys_total,
+				  ($pids_curr{$pid}{"stime"} - $pids_prev{$pid}{"stime"}) * 100 / $sys_total,
+				  ($pids_curr{$pid}{"gtime"} - $pids_prev{$pid}{"gtime"}) * 100 / $sys_total,
+				  ($pids_curr{$pid}{"utime"} - $pids_prev{$pid}{"utime"} + $pids_curr{$pid}{"stime"} - $pids_prev{$pid}{"stime"})  * 100 / $sys_total,
+				  pretty_print_memory_size($pids_curr{$pid}{"size"}),
+				  pretty_print_memory_size($pids_curr{$pid}{"resident"}),
+				  pretty_print_memory_size($pids_curr{$pid}{"shared"}),
+				  pretty_print_memory_size($pids_curr{$pid}{"text"}),
+				  pretty_print_memory_size($pids_curr{$pid}{"lib"}),
+				  pretty_print_memory_size($pids_curr{$pid}{"data"}),
+				  ($pids_curr{$pid}{"minor_page_faults"} - $pids_prev{$pid}{"minor_page_faults"}) / $delay,
+				  ($pids_curr{$pid}{"major_page_faults"} - $pids_prev{$pid}{"major_page_faults"}) / $delay,
+				  $pids_curr{$pid}{"cmd"});
+		    }
+		}
+	}
+
+	crit_sec_end();
+
+	%pids_prev = %pids_curr;
+	%pids_curr = ();
+	@sys_prev = @sys_curr;
+	@sys_curr = ();
+
+	if ($count > 0) {
+		$count--;
+	}
+}
+
+closedir(PROC);
+close(PROC_STAT);

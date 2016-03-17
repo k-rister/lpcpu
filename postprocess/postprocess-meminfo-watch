@@ -1,0 +1,575 @@
+#!/usr/bin/perl
+
+#
+# LPCPU (Linux Performance Customer Profiler Utility): ./postprocess/postprocess-meminfo-watch
+#
+# (C) Copyright IBM Corp. 2016
+#
+# This file is subject to the terms and conditions of the Eclipse
+# Public License.  See the file LICENSE.TXT in the main directory of the
+# distribution for more details.
+#
+
+
+# postprocess the meminfo-watch.ng profiler data
+
+use strict;
+#use Data::Dumper;
+use autobench::strings;
+use autobench::jschart;
+
+if (@ARGV < 1) {
+    print STDERR "postprocess-meminfo-watch: No working directory specified\n";
+    exit 1;
+}
+
+if (@ARGV < 2) {
+    print STDERR "postprocess-meminfo-watch: No identifier specified\n";
+    exit 1;
+}
+
+my $working_directory = $ARGV[0];
+my $identifier = $ARGV[1];
+
+my $input_file;
+my $invocation_id;
+
+if (@ARGV > 2) {
+    $invocation_id = $ARGV[2];
+
+    $input_file = "meminfo-watch." . $invocation_id . "." . $identifier;
+} else {
+    $input_file = "meminfo-watch." . $identifier;
+}
+
+print "Processing File : $input_file\n";
+
+my $i;
+my $x;
+my $key;
+
+my $meminfo_watch_interval = 5;
+if (!open(INPUT,"<$working_directory/profile-log.$identifier")) {
+    print STDERR "postprocess-meminfo-watch: could not open profiler log, using default meminfo_watch_inteval=[$meminfo_watch_interval]\n";
+}
+
+while (<INPUT>) {
+    if (@ARGV > 2) {
+	if (($_ =~ /starting meminfo-watch.$invocation_id \[[0-9]+\]/)) {
+	    $_ =~ m/.*\[([0-9]+)\].*/;
+	    $meminfo_watch_interval = $1;
+	    print "Discovered meminfo_watch_interval=[$meminfo_watch_interval]\n";
+	    last;
+	}
+    } else {
+	if (($_ =~ /starting meminfo-watch \[[0-9]+\]/)) {
+	    $_ =~ m/.*\[([0-9]+)\].*/;
+	    $meminfo_watch_interval = $1;
+	    print "Discovered meminfo_watch_interval=[$meminfo_watch_interval]\n";
+	    last;
+	}
+    }
+}
+
+close INPUT;
+
+if (!open(INPUT,"<$working_directory/$input_file")) {
+    print STDERR "postprocess-meminfo-watch: could not open specified input file\n";
+    exit 1;
+}
+
+my $output_directory;
+if (@ARGV > 2) {
+    $output_directory = "$working_directory/meminfo-watch-processed.$invocation_id.$identifier";
+} else {
+    $output_directory = "$working_directory/meminfo-watch-processed.$identifier";
+}
+mkdir $output_directory;
+mkdir "$output_directory/plot-files";
+
+my $line;
+my $mode = 0;
+
+my $num_numa_nodes = 0;
+my %nodes;
+my @fields;
+
+while (<INPUT>) {
+    chomp($line = $_);
+
+    if ($mode == 2) {
+	last;
+    }
+
+    if ($line =~ /= SAMPLE =/) {
+	$mode++;
+	next;
+    }
+
+    if ($mode == 1) {
+	if ($line =~ /^Node /) {
+	    @fields = split(" ", $line);
+
+	    if (! exists $nodes{$fields[1]}) {
+		$num_numa_nodes++;
+		$nodes{$fields[1]} = $num_numa_nodes;
+	    }
+	}
+    }
+}
+
+# seek back to the beginning of the file to start over and reset the mode tracker
+seek INPUT, 0, 0;
+$mode = 0;
+
+my @system_data;
+my @node_data;
+my %system_sample;
+my %node_sample;
+my %system_fields;
+my %system_fields_units;
+my %node_fields;
+my %node_fields_units;
+
+my $sample_line_counter = -1;
+my $blank_lines = -1;
+my $nodes_started = -1;
+my $sample_nodes = -1;
+while (<INPUT>) {
+    $sample_line_counter++;
+    chomp($line = $_);
+
+    if (length($line) == 0) {
+	$blank_lines++;
+    }
+
+    if ($line =~ /= SAMPLE =/) {
+	if ($sample_nodes == $num_numa_nodes) {
+	    push @node_data, { %node_sample };
+	}
+
+	$sample_line_counter = 0;
+	$blank_lines = 0;
+	$nodes_started = 0;
+	$sample_nodes = 0;
+	%node_sample = ();
+	next;
+    }
+
+    if ($sample_line_counter > 2) {
+	if ($nodes_started == 1) {
+	    if ($line !~ /^--$/) {
+		if (length($line) == 0) {
+		    next;
+		}
+
+		@fields = split(" ", $line);
+		$fields[2] =~ s/\(/__/;
+		$fields[2] =~ s/\)/__/;
+
+		$node_sample{$fields[1]}{$fields[2]} = $fields[3];
+
+		if (! exists $node_fields{$fields[2]}) {
+		    $node_fields{$fields[2]} = $sample_line_counter;
+		}
+
+		if ((@fields > 2) && (! exists $node_fields_units{$fields[2]})) {
+		    $node_fields_units{$fields[2]} = $fields[4];
+		}
+	    } else {
+		$sample_nodes++;
+	    }
+	} else {
+	    if ((length($line) > 0) && ($line !~ /^--$/)) {
+
+		@fields = split(" ", $line);
+		$fields[0] =~ s/\(/__/;
+		$fields[0] =~ s/\)/__/;
+
+		$system_sample{$fields[0]} = $fields[1];
+
+		if (! exists $system_fields{$fields[0]}) {
+		    $system_fields{$fields[0]} = $sample_line_counter;
+		}
+
+		if ((@fields > 2) && (! exists $system_fields_units{$fields[0]})) {
+		    $system_fields_units{$fields[0]} = $fields[2];
+		}
+	    } else {
+		if ($line =~ /^--$/) {
+		    push @system_data, { %system_sample };
+		    $nodes_started = 1;
+		    $sample_nodes++;
+		} elsif (! $num_numa_nodes) {
+		    push @system_data, { %system_sample };
+		}
+	    }
+	}
+    }
+}
+
+close INPUT;
+
+foreach $key (sort { $system_fields{$a} <=> $system_fields{$b} } (keys %system_fields)) {
+    $x = $key;
+    $x =~ s/://;
+
+    if (open(OUTPUT, ">$output_directory/plot-files/system.$x.plot")) {
+	print OUTPUT "#LABEL:System.$x\n";
+
+	for ($i=0; $i<@system_data; $i++) {
+	    print OUTPUT ($i * $meminfo_watch_interval) . ' ' . $system_data[$i]{$key} . "\n";
+	}
+
+	close OUTPUT;
+    } else {
+	print STDERR "postprocess-meminfo-watch: could not open $output_directory/plot-files/system.$key.plot for write\n";
+	exit 1;
+    }
+}
+
+foreach $key (sort { $node_fields{$a} <=> $node_fields{$b} } (keys %node_fields)) {
+    $x = $key;
+    $x =~ s/://;
+
+    foreach my $node (sort { $a <=> $b } (keys %nodes)) {
+	if (open(OUTPUT, ">$output_directory/plot-files/node.$node.$x.plot")) {
+	    print OUTPUT "#LABEL:Node $node\n";
+
+	    for ($i=0; $i<@node_data; $i++) {
+		print OUTPUT ($i * $meminfo_watch_interval) . ' ' . $node_data[$i]{$node}{$key} . "\n";
+	    }
+
+	    close OUTPUT;
+	} else {
+	    print STDERR "postprocess-meminfo-watch: could not open $output_directory/plot-files/node.$node.$x.plot for write\n";
+	    exit 1;
+	}
+    }
+}
+
+# data structure to hold list of fields to merge
+# each hash element holds a hash of data sets that should be merged together in on chart
+# when adding data sets delete the entries from the %system_fields hash to prevent double
+# charting
+my %merged_system_fields;
+
+if (exists $system_fields{'AnonPages:'} && exists $system_fields{'AnonHugePages:'}) {
+    # create merge entry
+    $merged_system_fields{'System Anonymous Pages'} = { 'AnonPages' => 1, 'AnonHugePages' => 1 };
+
+    # create unit entry for new merged chart
+    $system_fields_units{'System Anonymous Pages'} = $system_fields_units{'AnonPages:'};
+
+    # remove data sets to prevent individual charting
+    delete $system_fields{'AnonPages:'};
+    delete $system_fields{'AnonHugePages:'};
+}
+
+if (exists $system_fields{'Active:'} && exists $system_fields{'Inactive:'}) {
+    # create merge entry
+    $merged_system_fields{'System Memory Activity'} = { 'Active' => 1, 'Inactive' => 1 };
+
+    # create unity entry for new merged chart
+    $system_fields_units{'System Memory Activity'} = $system_fields_units{'Active:'};
+
+    # remove data sets to prevent individual charting
+    delete $system_fields{'Active:'};
+    delete $system_fields{'Inactive:'};
+}
+
+if (exists $system_fields{'Active__anon__:'} && exists $system_fields{'Inactive__anon__:'}) {
+    # create merge entry
+    $merged_system_fields{'System Anonymous Memory Activity'} = { 'Active__anon__' => 1, 'Inactive__anon__' => 1 };
+
+    # create unity entry for new merged chart
+    $system_fields_units{'System Anonymous Memory Activity'} = $system_fields_units{'Active__anon__:'};
+
+    # remove data sets to prevent individual charting
+    delete $system_fields{'Active__anon__:'};
+    delete $system_fields{'Inactive__anon__:'};
+}
+
+if (exists $system_fields{'Active__file__:'} && exists $system_fields{'Inactive__file__:'}) {
+    # create merge entry
+    $merged_system_fields{'System File Memory Activity'} = { 'Active__file__' => 1, 'Inactive__file__' => 1 };
+
+    # create unity entry for new merged chart
+    $system_fields_units{'System File Memory Activity'} = $system_fields_units{'Active__file__:'};
+
+    # remove data sets to prevent individual charting
+    delete $system_fields{'Active__file__:'};
+    delete $system_fields{'Inactive__file__:'};
+}
+
+if (! $ENV{'FORCE_CHART_PL'}) {
+    my $chart_page = new autobench::jschart("meminfo charts");
+    if ($ENV{'FORCE_JSCHART_REMOTE_LIBRARY'}) {
+	$chart_page->set_library_remote;
+    }
+
+    if (! $ENV{'FORCE_JSCHART_NO_PACKED_PLOTFILES'}) {
+	$chart_page->enable_packed_plotfiles($output_directory);
+    }
+
+    $chart_page->enable_raw_data_file_links('../');
+
+    $chart_page->add_link('system_link', '#system_section', 'System');
+
+    if ($num_numa_nodes) {
+	$chart_page->add_link('allnodes_link', '#allnodes_section', 'All Nodes');
+
+	foreach my $node (sort { $a <=> $b } (keys %nodes)) {
+	    print CHART_SCRIPT 'echo -e "<a href=\'#node' . $node . '\'>Node ' . $node . '</a>" >> chart.html' . "\n";
+	    $chart_page->add_link('node_' . $node, '#node_' . $node . '_section', 'Node ' . $node);
+	}
+    }
+
+    $chart_page->add_section('system_section', 'System');
+
+    # process un-merged system fields
+    foreach $key (sort { $system_fields{$a} <=> $system_fields{$b} } (keys %system_fields)) {
+	$x = $key;
+	$x =~ s/://;
+
+	my $unit = "";
+	if (exists $system_fields_units{$key}) {
+	    $unit = $system_fields_units{$key};
+	}
+
+	$chart_page->add_chart('system_' . $x, 'line', 'System ' . $x, 'Time (secs.)', "$unit");
+	$chart_page->add_plots('system_' . $x, 'system.' . $x);
+	$chart_page->add_raw_data_sources('system_' . $x, $input_file);
+    }
+
+    # process merged system fields
+    my $merge_counter = 0;
+    foreach $key (sort { $merged_system_fields{$a} <=> $merged_system_fields{$b} } (keys %merged_system_fields)) {
+	$merge_counter++;
+
+	my $unit = "";
+	if (exists $system_fields_units{$key}) {
+	    $unit = $system_fields_units{$key};
+	}
+
+	$chart_page->add_chart('system_merged_' . $merge_counter, 'line', $key, 'Time (secs.)', "$unit");
+
+	my $sub_key;
+	foreach $sub_key (sort { $merged_system_fields{$key}{$a} <=> $merged_system_fields{$key}{$b} } (keys %{ $merged_system_fields{$key} })) {
+	    $chart_page->add_plots('system_merged_' . $merge_counter, 'system.' . $sub_key);
+	}
+
+	$chart_page->add_raw_data_sources('system_merged_' . $merge_counter, $input_file);
+    }
+
+    if ($num_numa_nodes) {
+	$chart_page->add_section('allnodes_section', 'All Nodes');
+    }
+
+    foreach $key (sort { $node_fields{$a} <=> $node_fields{$b} } (keys %node_fields)) {
+	$x = $key;
+	$x =~ s/://;
+
+	my $unit = "";
+	if (exists $node_fields_units{$key}) {
+	    $unit = $node_fields_units{$key};
+	}
+
+	$chart_page->add_chart('allnodes_' . $x, 'line', 'All Nodes ' . $x, 'Time (secs.)', "$unit");
+
+	foreach my $node (sort { $a <=> $b } (keys %nodes)) {
+	    $chart_page->add_plots('allnodes_' . $x, 'node.' . $node . '.' . $x);
+	}
+
+	$chart_page->add_raw_data_sources('allnodes_' . $x, $input_file);
+    }
+
+    foreach my $node (sort { $a <=> $b } (keys %nodes)) {
+	$chart_page->add_section('node_' . $node . '_section', 'Node ' . $node);
+
+	foreach $key (sort { $node_fields{$a} <=> $node_fields{$b} } (keys %node_fields)) {
+
+	    $x = $key;
+	    $x =~ s/://;
+
+	    my $unit = "";
+	    if (exists $node_fields_units{$key}) {
+		$unit = $node_fields_units{$key};
+	    }
+
+	    $chart_page->add_chart('node_' . $node . '_' . $x, 'line', 'Node ' . $node . ' ' . $x, 'Time (secs.)', "$unit");
+	    $chart_page->add_plots('node_' . $node . '_' . $x, 'node.' . $node . '.' . $x);
+	    $chart_page->add_raw_data_sources('node_' . $node . '_' . $x, $input_file);
+	}
+    }
+
+    if (!open(CHART_HTML, ">$output_directory/chart.html")) {
+	print STDERR "postprocess-meminfo-watch: Could not create chart.html file\n";
+	exit 1;
+    } else {
+	chmod (0644, "$output_directory/chart.html");
+
+	print CHART_HTML $chart_page->dump_page;
+
+	close CHART_HTML;
+
+	if (! $ENV{'FORCE_JSCHART_NO_PACKED_PLOTFILES'}) {
+	    # clean up the non-packed plotfiles
+	    my $deleted_plotfile_count = unlink glob "$output_directory/plot-files/*.plot";
+	    #print "Deleted $deleted_plotfile_count plot files\n";
+	    if (! rmdir "$output_directory/plot-files") {
+		print STDERR "ERROR: Failed to delete $output_directory/plot-files!\n";
+	    }
+	}
+    }
+} else {
+    if (!open(CHART_SCRIPT, ">$output_directory/chart.sh")) {
+	print STDERR "postprocess-iostat: Could not create chart.sh file\n";
+	exit 1;
+    } else {
+	chmod (0777, "$output_directory/chart.sh");
+
+	print CHART_SCRIPT "#!/bin/bash\n\n";
+	print CHART_SCRIPT 'DIR=`dirname $0`' . "\n\n";
+	print CHART_SCRIPT 'if [ $# != 2 ]; then' . "\n";
+	print CHART_SCRIPT '  echo "You must specify the path to the chart.pl script and the Chart Directory libraries."' . "\n";
+	print CHART_SCRIPT '  exit 1' . "\n";
+	print CHART_SCRIPT 'fi' . "\n\n";
+	print CHART_SCRIPT 'SCRIPT=$1' . "\n";
+	print CHART_SCRIPT 'LIBRARIES=$2' . "\n\n";
+	print CHART_SCRIPT 'export PERL5LIB=$LIBRARIES' . "\n\n";
+	print CHART_SCRIPT 'pushd $DIR > /dev/null' . "\n\n";
+
+	my $graph_counter = 0;
+	my $max_length = length("" . (keys(%system_fields) + keys(%merged_system_fields) + keys(%node_fields) + keys(%nodes) * keys(%node_fields)) . "");
+
+	# process un-merged system fields
+	foreach $key (sort { $system_fields{$a} <=> $system_fields{$b} } (keys %system_fields)) {
+	    $x = $key;
+	    $x =~ s/://;
+
+	    my $unit = "";
+	    if (exists $system_fields_units{$key}) {
+		$unit = $system_fields_units{$key};
+	    }
+
+	    $graph_counter++;
+	    print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend($graph_counter, $max_length) . ' System ' . $x . '" -x "Time (secs.)" -y "' . $unit . '" plot-files/system.' . $x . '.plot' . "\n";
+	}
+
+	print CHART_SCRIPT "\n";
+
+	# process merged system fields
+	foreach $key (sort { $merged_system_fields{$a} <=> $merged_system_fields{$b} } (keys %merged_system_fields)) {
+	    $graph_counter++;
+
+	    my $unit = "";
+	    if (exists $system_fields_units{$key}) {
+		$unit = $system_fields_units{$key};
+	    }
+
+	    print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend($graph_counter, $max_length) . ' ' . $key . '" -x "Time (secs.)" -y "' . $unit . '" --legend-position bottom';
+
+	    my $sub_key;
+	    foreach $sub_key (sort { $merged_system_fields{$key}{$a} <=> $merged_system_fields{$key}{$b} } (keys %{ $merged_system_fields{$key} })) {
+		print CHART_SCRIPT ' plot-files/system.' . $sub_key . '.plot';
+	    }
+
+	    print CHART_SCRIPT "\n";
+	}
+
+	print CHART_SCRIPT "\n";
+
+	foreach $key (sort { $node_fields{$a} <=> $node_fields{$b} } (keys %node_fields)) {
+	    $x = $key;
+	    $x =~ s/://;
+
+	    my $unit = "";
+	    if (exists $node_fields_units{$key}) {
+		$unit = $node_fields_units{$key};
+	    }
+
+	    $graph_counter++;
+	    print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend($graph_counter, $max_length) . ' All Nodes ' . $x . '" -x "Time (secs.)" -y "' . $unit . '" plot-files/node.*.' . $x . '.plot' . "\n";
+	}
+
+	print CHART_SCRIPT "\n";
+
+	foreach my $node (sort { $a <=> $b } (keys %nodes)) {
+	    foreach $key (sort { $node_fields{$a} <=> $node_fields{$b} } (keys %node_fields)) {
+		$x = $key;
+		$x =~ s/://;
+
+		my $unit = "";
+		if (exists $node_fields_units{$key}) {
+		    $unit = $node_fields_units{$key};
+		}
+
+		$graph_counter++;
+		print CHART_SCRIPT '$SCRIPT --table html -s lines --title "' . manual_prepend($graph_counter, $max_length) . ' Node ' . $node . ' ' . $x . '" -x "Time (secs.)" -y "' . $unit . '" plot-files/node.' . $node . '.' . $x . '.plot' . "\n";
+	    }
+	}
+
+	print CHART_SCRIPT "\n";
+
+	print CHART_SCRIPT 'echo -e "<html>\n<head>\n<title>MemInfo Charts</title>\n</head>\n<body>\n" > chart.html' . "\n";
+
+	print CHART_SCRIPT 'echo -e "<a href=\'#system\'>System</a>" >> chart.html' . "\n";
+
+	if ($num_numa_nodes) {
+	    print CHART_SCRIPT 'echo -e "<a href=\'#allnodes\'>All Nodes</a>" >> chart.html' . "\n";
+	    foreach my $node (sort { $a <=> $b } (keys %nodes)) {
+		print CHART_SCRIPT 'echo -e "<a href=\'#node' . $node . '\'>Node ' . $node . '</a>" >> chart.html' . "\n";
+	    }
+	}
+
+	print CHART_SCRIPT 'echo -e "<br/>" >> chart.html' . "\n\n";
+
+	print CHART_SCRIPT 'echo -e "<a name=\'system\'><h1>System</h1></a>" >> chart.html' . "\n";
+	print CHART_SCRIPT 'for i in `ls -1 *System*.png`; do' . "\n";
+	print CHART_SCRIPT '  echo -e "<table>\n<tr valign=\'top\'>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  echo -e "<td><img src=\'$i\'></td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  html_file=`echo $i | sed -e "s/png/html/"`' . "\n";
+	print CHART_SCRIPT '  if [ -e $html_file ]; then' . "\n";
+	print CHART_SCRIPT '    echo -e "<td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '    cat $html_file >> chart.html' . "\n";
+	print CHART_SCRIPT '    echo -e "</td>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT '  fi' . "\n";
+	print CHART_SCRIPT '  echo -e "</tr>\n</table>\n" >> chart.html' . "\n";
+	print CHART_SCRIPT 'done' . "\n\n";
+
+	if ($num_numa_nodes) {
+	    print CHART_SCRIPT 'echo -e "<a name=\'allnodes\'><h1>All Nodes</h1></a>" >> chart.html' . "\n";
+	    print CHART_SCRIPT 'for i in `ls -1 *All_Nodes*.png 2> /dev/null`; do' . "\n";
+	    print CHART_SCRIPT '  echo -e "<table>\n<tr valign=\'top\'>\n" >> chart.html' . "\n";
+	    print CHART_SCRIPT '  echo -e "<td><img src=\'$i\'></td>\n" >> chart.html' . "\n";
+	    print CHART_SCRIPT '  html_file=`echo $i | sed -e "s/png/html/"`' . "\n";
+	    print CHART_SCRIPT '  if [ -e $html_file ]; then' . "\n";
+	    print CHART_SCRIPT '    echo -e "<td>\n" >> chart.html' . "\n";
+	    print CHART_SCRIPT '    cat $html_file >> chart.html' . "\n";
+	    print CHART_SCRIPT '    echo -e "</td>\n" >> chart.html' . "\n";
+	    print CHART_SCRIPT '  fi' . "\n";
+	    print CHART_SCRIPT '  echo -e "</tr>\n</table>\n" >> chart.html' . "\n";
+	    print CHART_SCRIPT 'done' . "\n\n";
+
+	    foreach my $node (sort { $a <=> $b } (keys %nodes)) {
+		print CHART_SCRIPT 'echo -e "<a name=\'node' . $node . '\'><h1>Node ' . $node . '</h1></a>" >> chart.html' . "\n";
+		print CHART_SCRIPT 'for i in `ls -1 *Node_' . $node . '*.png`; do' . "\n";
+		print CHART_SCRIPT '  echo -e "<table>\n<tr valign=\'top\'>\n" >> chart.html' . "\n";
+		print CHART_SCRIPT '  echo -e "<td><img src=\'$i\'></td>\n" >> chart.html' . "\n";
+		print CHART_SCRIPT '  html_file=`echo $i | sed -e "s/png/html/"`' . "\n";
+		print CHART_SCRIPT '  if [ -e $html_file ]; then' . "\n";
+		print CHART_SCRIPT '    echo -e "<td>\n" >> chart.html' . "\n";
+		print CHART_SCRIPT '    cat $html_file >> chart.html' . "\n";
+		print CHART_SCRIPT '    echo -e "</td>\n" >> chart.html' . "\n";
+		print CHART_SCRIPT '  fi' . "\n";
+		print CHART_SCRIPT '  echo -e "</tr>\n</table>\n" >> chart.html' . "\n\n";
+		print CHART_SCRIPT 'done' . "\n\n";
+	    }
+	}
+
+	print CHART_SCRIPT 'echo -e "</body>\n</html>\n" >> chart.html' . "\n";
+
+	close CHART_SCRIPT;
+    }
+}

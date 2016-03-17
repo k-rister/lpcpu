@@ -1,0 +1,1941 @@
+#!/usr/bin/perl
+
+#
+# LPCPU (Linux Performance Customer Profiler Utility): ./postprocess/postprocess-iostat
+#
+# (C) Copyright IBM Corp. 2016
+#
+# This file is subject to the terms and conditions of the Eclipse
+# Public License.  See the file LICENSE.TXT in the main directory of the
+# distribution for more details.
+#
+
+
+# postprocess the iostat profiler data
+
+use strict;
+#use Data::Dumper;
+use autobench::time;
+use Getopt::Long;
+use Storable;
+use autobench::jschart;
+
+# get the cli options and store them for parsing
+my %options;
+Getopt::Long::Configure ("bundling");
+Getopt::Long::Configure ("no_auto_abbrev");
+GetOptions(\%options, 'dir=s', 'run-number=s', 'id=s', 'bdh=s');
+
+if (! exists $options{'dir'} || ! exists $options{'run-number'}) {
+    print STDERR "ERROR: You must specify --dir=<working directory> and --run-number=<run number> and optionally --id=<invocation id> and/or --bdh=<bdh-data-file>\n";
+    exit 1;
+}
+
+my $working_directory = $options{'dir'};
+my $identifier = $options{'run-number'};
+
+my $input_file;
+my $invocation_id;
+
+if (exists $options{'id'}) {
+    $invocation_id = $options{'id'};
+
+    $input_file = "iostat." . $invocation_id . "." . $identifier;
+} else {
+    $input_file = "iostat." . $identifier;
+}
+
+my %bdh;
+my $bdh_exists = 0;
+
+if (exists $options{'bdh'}) {
+    # load the block device topology from the specified file
+
+    eval {
+	%bdh = %{Storable::retrieve($options{'bdh'})};
+    };
+
+    if ($@) {
+	print STDERR "ERROR: Failed to load the block device hierarchy data file from $options{'bdh'}!\n";
+	exit 1;
+    }
+
+    if (! exists $bdh{'block'} || ! exists $bdh{'adapters'}) {
+	print STDERR "ERROR: Loaded block device hierarchy does not contain valid block device hierarchy information!\n";
+	exit 1;
+    }
+
+    print "Loaded block device hierarchy data from $options{'bdh'}\n";
+
+    $bdh_exists = 1;
+}
+
+print "Processing File : $input_file\n";
+
+my $i;
+my $x;
+my $key;
+
+my $iostat_type = "disks";
+if (!open(INPUT,"<$working_directory/profile-log.$identifier")) {
+    print STDERR "postprocess-iostat: could not open profiler log, using default iostat_type=[$iostat_type]\n";
+} else {
+    while (<INPUT>) {
+	if (exists $options{'id'}) {
+	    if (($_ =~ /starting iostat.$invocation_id \[[0-9]+\] \[mode=[a-z]+\]/)) {
+		$_ =~ m/.*\[([0-9]+)\] \[mode=([a-z]+)\].*/;
+		$iostat_type = $2;
+		print "Discovered iostat_type=[$iostat_type]\n";
+		last;
+	    }
+	} else {
+	    if (($_ =~ /starting iostat \[[0-9]+\] \[mode=[a-z]+\]/)) {
+		$_ =~ m/.*\[([0-9]+)\] \[mode=([a-z]+)\].*/;
+		$iostat_type = $2;
+		print "Discovered iostat_type=[$iostat_type]\n";
+		last;
+	    }
+	}
+    }
+
+    close INPUT;
+}
+
+if (!open(INPUT,"<$working_directory/$input_file")) {
+    print STDERR "postprocess-iostat: could not open specified input file\n";
+    exit 1;
+}
+
+my $output_directory;
+if (exists $options{'id'}) {
+    $output_directory = "$working_directory/iostat-processed.$invocation_id.$identifier";
+} else {
+    $output_directory = "$working_directory/iostat-processed.$identifier";
+}
+mkdir $output_directory;
+mkdir "$output_directory/plot-files";
+
+my $line;
+my $mode = 0;
+
+my $num_devices = 0;
+my %devices;
+my @fields;
+
+my $first_timestamp = 0;
+my $last_timestamp = 0;
+my $current_timestamp = 0;
+my $timestamp_wrap_adjustment = 0;
+
+while (<INPUT>) {
+    chomp($line = $_);
+
+    if (($mode == 1) && (length($line) == 0)) {
+	last;
+    }
+
+    if ($line =~ /Device.*/) {
+	$mode = 1;
+	next;
+    }
+
+    if ($mode == 1) {
+	$num_devices++;
+	@fields = split(" ", $line);
+
+	$devices{$fields[0]} = $num_devices;
+    } elsif ($line =~ /.*:.*:.*/) {
+	if ($line =~ /^Time:/) {
+	    $line =~ s/^Time:\s+//;
+	}
+
+	$first_timestamp = time_in_seconds($line);
+	$current_timestamp = $first_timestamp;
+    }
+}
+
+# by default, disable open/close mode
+# if the number of devices is too large this mode will be enabled to
+# prevent plot-file creation from failing due to not enough file
+# handles
+my $open_close_mode = 0;
+
+# in default mode there are 11 columns of data being written to a file for each device
+my $max_expected_file_handles_per_device = 11;
+
+# figure out what the maximum number of file handles that the current environment supports is
+my $max_file_handles_supported = `bash -c "ulimit -n"`;
+my $ret_val = $? >> 8;
+if ($ret_val) {
+    # assume the default if the query did not work
+    $max_file_handles_supported = 1024;
+} else {
+    chomp($max_file_handles_supported);
+}
+
+# seek back to the beginning of the file to start over and reset the mode tracker
+seek INPUT, 0, 0;
+$mode = 0;
+my $current_device = 0;
+
+my $kb_read_plot_files = "";
+my @kb_read_plot_array;
+
+my $kb_write_plot_files = "";
+my @kb_write_plot_array;
+
+my $riops_plot_files = "";
+my @riops_plot_array;
+
+my $wiops_plot_files = "";
+my @wiops_plot_array;
+
+my $transaction_plot_files = "";
+my @transaction_plot_array;
+
+my $rrqm_plot_files = "";
+my @rrqm_plot_array;
+
+my $wrqm_plot_files = "";
+my @wrqm_plot_array;
+
+my $avg_req_plot_files = "";
+my @avg_req_plot_array;
+
+my $avg_r_req_plot_files = "";
+my @avg_r_req_plot_array;
+
+my $avg_w_req_plot_files = "";
+my @avg_w_req_plot_array;
+
+my $avg_que_plot_files = "";
+my @avg_que_plot_array;
+
+my $wait_time_plot_files = "";
+my @wait_time_plot_array;
+
+my $waitr_time_plot_files = "";
+my @waitr_time_plot_array;
+
+my $waitw_time_plot_files = "";
+my @waitw_time_plot_array;
+
+my $service_time_plot_files = "";
+my @service_time_plot_array;
+
+my $util_plot_files = "";
+my @util_plot_array;
+
+my $dm_kb_read_plot_files = "";
+my @dm_kb_read_plot_array;
+
+my $dm_kb_write_plot_files = "";
+my @dm_kb_write_plot_array;
+
+my $dm_riops_plot_files = "";
+my @dm_riops_plot_array;
+
+my $dm_wiops_plot_files = "";
+my @dm_wiops_plot_array;
+
+my $dm_transaction_plot_files = "";
+my @dm_transaction_plot_array;
+
+my $dm_rrqm_plot_files = "";
+my @dm_rrqm_plot_array;
+
+my $dm_wrqm_plot_files = "";
+my @dm_wrqm_plot_array;
+
+my $dm_avg_req_plot_files = "";
+my @dm_avg_req_plot_array;
+
+my $dm_avg_r_req_plot_files = "";
+my @dm_avg_r_req_plot_array;
+
+my $dm_avg_w_req_plot_files = "";
+my @dm_avg_w_req_plot_array;
+
+my $dm_avg_que_plot_files = "";
+my @dm_avg_que_plot_array;
+
+my $dm_wait_time_plot_files = "";
+my @dm_wait_time_plot_array;
+
+my $dm_waitr_time_plot_files = "";
+my @dm_waitr_time_plot_array;
+
+my $dm_waitw_time_plot_files = "";
+my @dm_waitw_time_plot_array;
+
+my $dm_service_time_plot_files = "";
+my @dm_service_time_plot_array;
+
+my $dm_util_plot_files = "";
+my @dm_util_plot_array;
+
+my $dm_device_count = 0;
+my $phys_device_count = 0;
+
+my @device_rkb_file_handles;
+my @device_rkb_file_names;
+
+my @device_wkb_file_handles;
+my @device_wkb_file_names;
+
+my $r_w_request = 0;
+my $r_w_wait = 0;
+my $r_w_request_offset = 0;
+my $r_w_wait_offset = 0;
+
+my $throughput_unit = "KB";
+
+if ($iostat_type eq "disks") {
+    while (<INPUT>) {
+	my $end_loop = 0;
+
+	# check if the iostat file being processed contains the read and write wait times broken out
+	if (($_ =~ /Device.*/) && (($_ =~ /r_await/) || ($_ =~ /awaitr/))) {
+	    $r_w_wait = 1;
+	    $r_w_wait_offset = 2;
+
+	    $end_loop = 1;
+	}
+
+	# check if the iostat file being processed contains the read and write request sizes broken out
+	if (($_ =~ /Device.*/) && ($_ =~ /r_rq-sz/)) {
+	    $r_w_request = 1;
+	    $r_w_request_offset = 2;
+
+	    $end_loop = 1;
+	}
+
+	if ($end_loop) {
+	    last;
+	}
+    }
+
+    # seek back to the beginning of the file to start over and reset the mode tracker
+    seek INPUT, 0, 0;
+
+    if ($r_w_wait == 1) {
+	print "Processing iostat data file with broken out read/write wait times\n";
+
+	$max_expected_file_handles_per_device += 2;
+    }
+
+    if ($r_w_request == 1) {
+	print "Processing iostat data file with broken out read/write request sizes\n";
+
+	$max_expected_file_handles_per_device += 2;
+    }
+
+    # see if the expected number of files to be opened exceeds the
+    # number of file handles supported by the environment
+    # add 2 extra devices for some fluff, just to be cautious
+    if (($max_expected_file_handles_per_device * ($num_devices + 2)) > $max_file_handles_supported) {
+	print "Enabling open/close mode for plot-file creation due to large number of devices\n";
+
+	$open_close_mode = 1;
+    }
+
+    my @device_rrqm_file_handles;
+    my @device_rrqm_file_names;
+    my @device_wrqm_file_handles;
+    my @device_wrqm_file_names;
+
+    my @device_riops_file_handles;
+    my @device_riops_file_names;
+    my @device_wiops_file_handles;
+    my @device_wiops_file_names;
+
+    my @device_avgrqsz_file_handles;
+    my @device_avgrqsz_file_names;
+    my @device_r_rqsz_file_handles;
+    my @device_r_rqsz_file_names;
+    my @device_w_rqsz_file_handles;
+    my @device_w_rqsz_file_names;
+    my @device_avgqusz_file_handles;
+    my @device_avgqusz_file_names;
+
+    my @device_await_file_handles;
+    my @device_await_file_names;
+    my @device_awaitr_file_handles;
+    my @device_awaitr_file_names;
+    my @device_awaitw_file_handles;
+    my @device_awaitw_file_names;
+    my @device_svctm_file_handles;
+    my @device_svctm_file_names;
+
+    my @device_util_file_handles;
+    my @device_util_file_names;
+
+    foreach $key (keys %devices) {
+	$x = $devices{$key};
+
+	my $label = $key;
+
+	if ($bdh_exists) {
+	    # since we have bdh data let's see if we can translate the
+	    # short name that is used in iostat to the actual name
+	    # which makes for much easier interpretation of the graphs
+
+	    foreach my $key2 (keys %{$bdh{'block'}}) {
+		if ($key eq $bdh{'block'}{$key2}{'short_name'}) {
+		    if (exists $bdh{'block'}{$key2}{'long_name'}) {
+			$label = $bdh{'block'}{$key2}{'long_name'} . "(" . $key . ")";
+		    }
+		}
+	    }
+	}
+
+	init_file(\@device_rkb_file_handles, \@device_rkb_file_names, $x, "$output_directory/plot-files/$key.rkb.plot", "#LABEL:$label\n");
+
+	init_file(\@device_wkb_file_handles, \@device_wkb_file_names, $x, "$output_directory/plot-files/$key.wkb.plot", "#LABEL:$label\n");
+
+	if (($key =~ /^dm-/) || ($key =~ /-/)) {
+	    $dm_device_count++;
+
+	    $dm_kb_read_plot_files = $dm_kb_read_plot_files . " ../plot-files/$key.rkb.plot";
+	    push @dm_kb_read_plot_array, "$key.rkb";
+
+	    $dm_kb_write_plot_files = $dm_kb_write_plot_files . " ../plot-files/$key.wkb.plot";
+	    push @dm_kb_write_plot_array, "$key.wkb";
+	} else {
+	    $phys_device_count++;
+
+	    $kb_read_plot_files = $kb_read_plot_files . " ../plot-files/$key.rkb.plot";
+	    push @kb_read_plot_array, "$key.rkb";
+
+	    $kb_write_plot_files = $kb_write_plot_files . " ../plot-files/$key.wkb.plot";
+	    push @kb_write_plot_array, "$key.wkb";
+	}
+
+
+	init_file(\@device_riops_file_handles, \@device_riops_file_names, $x, "$output_directory/plot-files/$key.riops.plot", "#LABEL:$label\n");
+
+	init_file(\@device_wiops_file_handles, \@device_wiops_file_names, $x, "$output_directory/plot-files/$key.wiops.plot", "#LABEL:$label\n");
+    
+	if (($key =~ /^dm-/) || ($key =~ /-/)) {
+	    $dm_riops_plot_files = $dm_riops_plot_files . " ../plot-files/$key.riops.plot";
+	    push @dm_riops_plot_array, "$key.riops";
+
+	    $dm_wiops_plot_files = $dm_wiops_plot_files . " ../plot-files/$key.wiops.plot";
+	    push @dm_wiops_plot_array, "key.wiops";
+	} else {
+	    $riops_plot_files = $riops_plot_files . " ../plot-files/$key.riops.plot";
+	    push @riops_plot_array, "$key.riops";
+
+	    $wiops_plot_files = $wiops_plot_files . " ../plot-files/$key.wiops.plot";
+	    push @wiops_plot_array, "$key.wiops";
+	}
+
+
+	init_file(\@device_rrqm_file_handles, \@device_rrqm_file_names, $x, "$output_directory/plot-files/$key.rrqm.plot", "#LABEL:$label\n");
+
+	init_file(\@device_wrqm_file_handles, \@device_wrqm_file_names, $x, "$output_directory/plot-files/$key.wrqm.plot", "#LABEL:$label\n");
+
+	if (($key =~ /^dm-/) || ($key =~ /-/)) {
+	    $dm_rrqm_plot_files = $dm_rrqm_plot_files . " ../plot-files/$key.rrqm.plot";
+	    push @dm_rrqm_plot_array, "$key.rrqm";
+
+	    $dm_wrqm_plot_files = $dm_wrqm_plot_files . " ../plot-files/$key.wrqm.plot";
+	    push @dm_wrqm_plot_array, "$key.wrqm";
+	} else {
+	    $rrqm_plot_files = $rrqm_plot_files . " ../plot-files/$key.rrqm.plot";
+	    push @rrqm_plot_array, "$key.rrqm";
+
+	    $wrqm_plot_files = $wrqm_plot_files . " ../plot-files/$key.wrqm.plot";
+	    push @wrqm_plot_array, "$key.wrqm";
+	}
+
+
+	init_file(\@device_avgrqsz_file_handles, \@device_avgrqsz_file_names, $x, "$output_directory/plot-files/$key.avgrq-sz.plot", "#LABEL:$label\n");
+
+	if ($r_w_request) {
+	    init_file(\@device_r_rqsz_file_handles, \@device_r_rqsz_file_names, $x, "$output_directory/plot-files/$key.r_rqsz.plot", "#LABEL:$label\n");
+
+	    init_file(\@device_w_rqsz_file_handles, \@device_w_rqsz_file_names, $x, "$output_directory/plot-files/$key.w_rqsz.plot", "#LABEL:$label\n");
+	}
+
+	init_file(\@device_avgqusz_file_handles, \@device_avgqusz_file_names, $x, "$output_directory/plot-files/$key.avgqu-sz.plot", "#LABEL:$label\n");
+
+	if (($key =~ /^dm-/) || ($key =~ /-/)) {
+	    $dm_avg_req_plot_files = $dm_avg_req_plot_files . " ../plot-files/$key.avgrq-sz.plot";
+	    push @dm_avg_req_plot_array, "$key.avgrq-sz";
+
+	    if ($r_w_request) {
+		$dm_avg_r_req_plot_files = $dm_avg_r_req_plot_files . " ../plot-files/$key.r_rqsz.plot";
+		push @dm_avg_r_req_plot_array, "$key.r_rqsz";
+
+		$dm_avg_w_req_plot_files = $dm_avg_w_req_plot_files . " ../plot-files/$key.w_rqsz.plot";
+		push @dm_avg_w_req_plot_array, "$key.w_rqsz";
+	    }
+
+	    $dm_avg_que_plot_files = $dm_avg_que_plot_files . " ../plot-files/$key.avgqu-sz.plot";
+	    push @dm_avg_que_plot_array, "$key.avgqu-sz";
+	} else {
+	    $avg_req_plot_files = $avg_req_plot_files . " ../plot-files/$key.avgrq-sz.plot";
+	    push @avg_req_plot_array, "$key.avgrq-sz";
+
+	    if ($r_w_request) {
+		$avg_r_req_plot_files = $avg_r_req_plot_files . " ../plot-files/$key.r_rqsz.plot";
+		push @avg_r_req_plot_array, "$key.r_rqsz";
+
+		$avg_w_req_plot_files = $avg_w_req_plot_files . " ../plot-files/$key.w_rqsz.plot";
+		push @avg_w_req_plot_array, "$key.w_rqsz";
+	    }
+
+	    $avg_que_plot_files = $avg_que_plot_files . " ../plot-files/$key.avgqu-sz.plot";
+	    push @avg_que_plot_array, "$key.avgqu-sz";
+	}
+
+
+	init_file(\@device_await_file_handles, \@device_await_file_names, $x, "$output_directory/plot-files/$key.await.plot", "#LABEL:$label\n");
+
+	if ($r_w_wait) {
+	    init_file(\@device_awaitr_file_handles, \@device_awaitr_file_names, $x, "$output_directory/plot-files/$key.awaitr.plot", "#LABEL:$label\n");
+
+	    init_file(\@device_awaitw_file_handles, \@device_awaitw_file_names, $x, "$output_directory/plot-files/$key.awaitw.plot", "#LABEL:$label\n");
+	}
+
+	init_file(\@device_svctm_file_handles, \@device_svctm_file_names, $x, "$output_directory/plot-files/$key.svctm.plot", "#LABEL:$label\n");
+
+	if (($key =~ /^dm-/) || ($key =~ /-/)) {
+	    $dm_wait_time_plot_files = $dm_wait_time_plot_files . " ../plot-files/$key.await.plot";
+	    push @dm_wait_time_plot_array, "$key.await";
+
+	    if ($r_w_wait) {
+		$dm_waitr_time_plot_files = $dm_waitr_time_plot_files . " ../plot-files/$key.awaitr.plot";
+		push @dm_waitr_time_plot_array, "$key.awaitr";
+
+		$dm_waitw_time_plot_files = $dm_waitw_time_plot_files . " ../plot-files/$key.awaitw.plot";
+		push @dm_waitw_time_plot_array, "$key.awaitw";
+	    }
+
+	    $dm_service_time_plot_files = $dm_service_time_plot_files. " ../plot-files/$key.svctm.plot";
+	    push @dm_service_time_plot_array, "$key.svctm";
+	} else {
+	    $wait_time_plot_files = $wait_time_plot_files . " ../plot-files/$key.await.plot";
+	    push @wait_time_plot_array, "$key.await";
+
+	    if ($r_w_wait) {
+		$waitr_time_plot_files = $waitr_time_plot_files . " ../plot-files/$key.awaitr.plot";
+		push @waitr_time_plot_array, "$key.awaitr";
+
+		$waitw_time_plot_files = $waitw_time_plot_files . " ../plot-files/$key.awaitw.plot";
+		push @waitw_time_plot_array, "$key.awaitw";
+	    }
+
+	    $service_time_plot_files = $service_time_plot_files. " ../plot-files/$key.svctm.plot";
+	    push @service_time_plot_array, "$key.svctm";
+	}
+
+
+	init_file(\@device_util_file_handles, \@device_util_file_names, $x, "$output_directory/plot-files/$key.util.plot", "#LABEL:$label\n");
+
+	if (($key =~ /^dm-/) || ($key =~ /-/)) {
+	    $dm_util_plot_files = $dm_util_plot_files . " ../plot-files/$key.util.plot";
+	    push @dm_util_plot_array, "$key.util";
+	} else {
+	    $util_plot_files = $util_plot_files . " ../plot-files/$key.util.plot";
+	    push @util_plot_array, "$key.util";
+	}
+    }
+
+    my $index_base = 0;
+
+    my $sample_counter = 0;
+    while (<INPUT>) {
+	chomp($line = $_);
+
+	if (($mode == 2) && ($line =~ /.*:.*:.*/)) {
+	    $sample_counter++;
+
+	    if ($line =~ /^Time:/) {
+		$line =~ s/^Time:\s+//;
+	    }
+
+	    $last_timestamp = $current_timestamp;
+	    $current_timestamp = time_in_seconds($line);
+	    if ($current_timestamp < ($last_timestamp * .95)) {
+		$timestamp_wrap_adjustment += 24*60*60;
+	    }
+	}
+
+	if ($line =~ /Device.*/) {
+	    $mode = 1;
+
+	    # new versions of iostat have either sectors or kilobytes per second, not both
+	    # set the column number where kilobytes per second is by checking if the data contains sectors per second
+	    if ($line =~ /rsec/) {
+		$index_base = 7;
+	    } else {
+		$index_base = 5;
+	    }
+
+	    if ($line =~ /rkB\/s/) {
+		$throughput_unit = "KB";
+	    } elsif ($line =~ /rMB\/s/) {
+		$throughput_unit = "MB";
+	    } else {
+		$throughput_unit = "sectors";
+	    }
+
+	    next;
+	}
+
+	if (length($line) == 0) {
+	    $mode = 2;
+	    next;
+	}
+
+	if (($mode == 1) && ($sample_counter > 1)) {
+	    @fields = split(" ", $line);
+
+	    if (exists $devices{$fields[0]}) {
+		$current_device = $devices{$fields[0]};
+	    } else {
+		next;
+	    }
+
+	    write_to_file(\@device_rrqm_file_handles, \@device_rrqm_file_names, $current_device, ">>", ($current_timestamp - $first_timestamp + $timestamp_wrap_adjustment) . " $fields[1]\n");
+	    write_to_file(\@device_wrqm_file_handles, \@device_wrqm_file_names, $current_device, ">>", ($current_timestamp - $first_timestamp + $timestamp_wrap_adjustment) . " $fields[2]\n");
+
+	    write_to_file(\@device_riops_file_handles, \@device_riops_file_names, $current_device, ">>", ($current_timestamp - $first_timestamp + $timestamp_wrap_adjustment) . " $fields[3]\n");
+	    write_to_file(\@device_wiops_file_handles, \@device_wiops_file_names, $current_device, ">>", ($current_timestamp - $first_timestamp + $timestamp_wrap_adjustment) . " $fields[4]\n");
+
+	    write_to_file(\@device_rkb_file_handles, \@device_rkb_file_names, $current_device, ">>", ($current_timestamp - $first_timestamp + $timestamp_wrap_adjustment) . " $fields[$index_base]\n");
+	    write_to_file(\@device_wkb_file_handles, \@device_wkb_file_names, $current_device, ">>", ($current_timestamp - $first_timestamp + $timestamp_wrap_adjustment) . " $fields[$index_base + 1]\n");
+
+	    write_to_file(\@device_avgrqsz_file_handles, \@device_avgrqsz_file_names, $current_device, ">>", ($current_timestamp - $first_timestamp + $timestamp_wrap_adjustment) . " $fields[$index_base + 2]\n");
+
+	    if ($r_w_request) {
+		write_to_file(\@device_r_rqsz_file_handles, \@device_r_rqsz_file_names, $current_device, ">>", ($current_timestamp - $first_timestamp + $timestamp_wrap_adjustment) . " $fields[$index_base + 3]\n");
+		write_to_file(\@device_w_rqsz_file_handles, \@device_w_rqsz_file_names, $current_device, ">>", ($current_timestamp - $first_timestamp + $timestamp_wrap_adjustment) . " $fields[$index_base + 4]\n");
+	    }
+
+	    write_to_file(\@device_avgqusz_file_handles, \@device_avgqusz_file_names, $current_device, ">>", ($current_timestamp - $first_timestamp + $timestamp_wrap_adjustment) . " $fields[$index_base + 3 + $r_w_request_offset]\n");
+
+	    write_to_file(\@device_await_file_handles, \@device_await_file_names, $current_device, ">>", ($current_timestamp - $first_timestamp + $timestamp_wrap_adjustment) . " $fields[$index_base + 4 + $r_w_request_offset]\n");
+
+	    if ($r_w_wait) {
+		write_to_file(\@device_awaitr_file_handles, \@device_awaitr_file_names, $current_device, ">>", ($current_timestamp - $first_timestamp + $timestamp_wrap_adjustment) . " $fields[$index_base + 5 + $r_w_request_offset]\n");
+		write_to_file(\@device_awaitw_file_handles, \@device_awaitw_file_names, $current_device, ">>", ($current_timestamp - $first_timestamp + $timestamp_wrap_adjustment) . " $fields[$index_base + 6 + $r_w_request_offset]\n");
+	    }
+
+	    write_to_file(\@device_svctm_file_handles, \@device_svctm_file_names, $current_device, ">>", ($current_timestamp - $first_timestamp + $timestamp_wrap_adjustment) . " $fields[$index_base + 5 + $r_w_request_offset + $r_w_wait_offset]\n");
+
+	    write_to_file(\@device_util_file_handles, \@device_util_file_names, $current_device, ">>", ($current_timestamp - $first_timestamp + $timestamp_wrap_adjustment) . " $fields[$index_base + 6 + $r_w_request_offset + $r_w_wait_offset]\n");
+	}
+    }
+
+    foreach $key (keys %devices) {
+	$x = $devices{$key};
+
+	close $device_rrqm_file_handles[$x] if fileno($device_rrqm_file_handles[$x]);
+	close $device_wrqm_file_handles[$x] if fileno($device_wrqm_file_handles[$x]);
+
+	close $device_wkb_file_handles[$x] if fileno($device_wkb_file_handles[$x]);
+	close $device_rkb_file_handles[$x] if fileno($device_rkb_file_handles[$x]);
+
+	close $device_riops_file_handles[$x] if fileno($device_riops_file_handles[$x]);
+	close $device_wiops_file_handles[$x] if fileno($device_wiops_file_handles[$x]);
+
+	close $device_avgrqsz_file_handles[$x] if fileno($device_avgrqsz_file_handles[$x]);
+
+	if ($r_w_request) {
+	    close $device_r_rqsz_file_handles[$x] if fileno($device_r_rqsz_file_handles[$x]);
+	    close $device_w_rqsz_file_handles[$x] if fileno($device_w_rqsz_file_handles[$x]);
+	}
+
+	close $device_avgqusz_file_handles[$x] if fileno($device_avgqusz_file_handles[$x]);
+
+	close $device_await_file_handles[$x] if fileno($device_await_file_handles[$x]);
+
+	if ($r_w_wait) {
+	    close $device_awaitr_file_handles[$x] if fileno($device_awaitr_file_handles[$x]);
+	    close $device_awaitw_file_handles[$x] if fileno($device_awaitw_file_handles[$x]);
+	}
+
+	close $device_svctm_file_handles[$x] if fileno($device_svctm_file_handles[$x]);
+
+	close $device_util_file_handles[$x] if fileno($device_util_file_handles[$x]);
+    }
+} elsif ($iostat_type eq "partitions") {
+    my @device_transaction_file_handles;
+    my @device_transaction_file_names;
+
+    # partition mode has far fewer file handles per device
+    $max_expected_file_handles_per_device = 3;
+
+    # see if the expected number of files to be opened exceeds the
+    # number of file handles supported by the environment
+    # add 2 extra devices for some fluff, just to be cautious
+    if (($max_expected_file_handles_per_device * ($num_devices + 2)) > $max_file_handles_supported) {
+	print "Enabling open/close mode for plot-file creation due to large number of devices\n";
+
+	$open_close_mode = 1;
+    }
+
+    foreach $key (keys %devices) {
+	$x = $devices{$key};
+
+	init_file(\@device_transaction_file_handles, \@device_transaction_file_names, $x, "$output_directory/plot-files/$key.transaction.plot", "#LABEL:$key\n");
+
+	init_file(\@device_rkb_file_handles, \@device_rkb_file_names, $x, "$output_directory/plot-files/$key.rkb.plot", "#LABEL:$key\n");
+
+	init_file(\@device_wkb_file_handles, \@device_wkb_file_names, $x, "$output_directory/plot-files/$key.wkb.plot", "#LABEL:$key\n");
+
+	if (($key =~ /^dm-/) || ($key =~ /-/)) {
+	    $dm_device_count++;
+
+	    $dm_kb_read_plot_files = $dm_kb_read_plot_files . " ../plot-files/$key.rkb.plot";
+	    push @dm_kb_read_plot_array, "$key.rkb";
+
+	    $dm_kb_write_plot_files = $dm_kb_write_plot_files . " ../plot-files/$key.wkb.plot";
+	    push @dm_kb_write_plot_array, "$key.wkb";
+
+	    $dm_transaction_plot_files = $dm_transaction_plot_files . " ../plot-files/$key.transaction.plot";
+	    push @dm_transaction_plot_array, "$key.transaction";
+	} else {
+	    $kb_read_plot_files = $kb_read_plot_files . " ../plot-files/$key.rkb.plot";
+	    push @kb_read_plot_array, "$key.rkb";
+
+	    $kb_write_plot_files = $kb_write_plot_files . " ../plot-files/$key.wkb.plot";
+	    push @kb_write_plot_array, "$key.wkb";
+
+	    $transaction_plot_files = $transaction_plot_files . " ../plot-files/$key.transaction.plot";
+	    push @transaction_plot_array, "$key.transaction";
+	}
+    }
+
+    my $sample_counter = 0;
+    while (<INPUT>) {
+	chomp $_;
+	$line = $_;
+
+	if (($mode == 2) && ($line =~ /.*:.*:.*/)) {
+	    $sample_counter++;
+
+	    if ($line =~ /^Time:/) {
+		$line =~ s/^Time:\s+//;
+	    }
+
+	    $last_timestamp = $current_timestamp;
+	    $current_timestamp = time_in_seconds($line);
+	    if ($current_timestamp < ($last_timestamp * .95)) {
+		$timestamp_wrap_adjustment += 24*60*60;
+	    }
+	}
+
+	if ($line =~ /Device.*/) {
+	    $mode = 1;
+	    next;
+	}
+
+	if (length($line) == 0) {
+	    $mode = 2;
+	    next;
+	}
+
+	if (($mode == 1) && ($sample_counter > 1)) {
+	    @fields = split(" ", $line);
+
+	    if (exists $devices{$fields[0]}) {
+		$current_device = $devices{$fields[0]};
+	    } else {
+		next;
+	    }
+
+	    write_to_file(\@device_transaction_file_handles, \@device_transaction_file_names, $current_device, ">>", ($current_timestamp - $first_timestamp) . " $fields[1]\n");
+	    write_to_file(\@device_rkb_file_handles, \@device_rkb_file_names, $current_device, ">>", ($current_timestamp - $first_timestamp) . " $fields[2]\n");
+	    write_to_file(\@device_wkb_file_handles, \@device_wkb_file_names, $current_device, ">>", ($current_timestamp - $first_timestamp) . " $fields[3]\n");
+	}
+    }
+
+    foreach $key (keys %devices) {
+	$x = $devices{$key};
+
+	close $device_transaction_file_handles[$x] if fileno($device_transaction_file_handles[$x]);
+	close $device_rkb_file_handles[$x] if fileno($device_rkb_file_handles[$x]);
+	close $device_wkb_file_handles[$x] if fileno($device_wkb_file_handles[$x]);
+    }    
+}
+
+close INPUT;
+
+my $file_name;
+my $charting_type;
+my $file_mode;
+
+if (! $ENV{'FORCE_CHART_PL'}) {
+    $file_name = "bdh-chart.html";
+    $file_mode = 0644;
+    $charting_type = "jschart";
+} else {
+    $file_name = "chart.sh";
+    $file_mode = 0777;
+    $charting_type = "chartpl";
+}
+
+if (exists $bdh{'block'} && exists $bdh{'adapters'} && ($iostat_type eq "disks")) {
+    if ($iostat_type eq "disks") {
+	my $max_layer = 0;
+	foreach my $key (keys %{$bdh{'block'}}) {
+	    if ($bdh{'block'}{$key}{'layer'} > $max_layer) {
+		$max_layer = $bdh{'block'}{$key}{'layer'};
+	    }
+	}
+
+	if (!open(LINK_PAGE, ">", "$output_directory/chart.html")) {
+	    print STDERR "ERROR: Failed to open $output_directory/chart.html for writing!\n";
+	}
+
+	print LINK_PAGE "<html>\n<head>\n<title>Iostat with Block Device Hierarchy</title>\n</head>\n<body>\n";
+
+	mkdir "$output_directory/top-level";
+	if (open(CHART_FILE, ">", "$output_directory/top-level/$file_name")) {
+	    chmod ($file_mode, "$output_directory/top-level/$file_name");
+
+	    print CHART_FILE get_chart_script_header($charting_type);
+
+	    my %plot_data;
+	    my @plot_devices;
+
+	    # a device is considered to be "top level" if the following conditions are met:
+	    #   1) it is not a component of a device (example: a PV consumed in an LV is not top level)
+	    #   2) if it is a partition, did iostat include partition data
+	    #   3) it has not been top level blacklisted -- the user has a reason for this device to not be top level
+	    #   4) it has been top level whitelisted -- the opposite of blacklist, the user has requested it be top level
+	    foreach my $key (sort device_sort keys %{$bdh{'block'}}) {
+		if ((! exists $bdh{'block'}{$key}{'sub_components'}) &&
+		    include_partitions(exists $bdh{'block'}{$key}{'partition'}, exists $devices{$bdh{'block'}{$key}{'short_name'}}) &&
+		    (! exists $bdh{'block'}{$key}{'top-level-blacklist'}) ||
+		    (exists $bdh{'block'}{$key}{'top-level-whitelist'})) {
+
+		    # make sure the device exists in the iostat data
+		    if (exists $devices{$bdh{'block'}{$key}{'short_name'}}) {
+			$bdh{'block'}{$key}{'iostat'} = 1;
+			push @plot_devices, $bdh{'block'}{$key}{'short_name'};
+		    } else {
+			$bdh{'block'}{$key}{'iostat'} = 0;
+		    }
+		}
+	    }
+
+	    create_devices_plot_data(\%plot_data, \@plot_devices);
+
+	    print CHART_FILE get_chart_script_commands_devices($charting_type, "Top Level", \%plot_data, $output_directory);
+
+	    print CHART_FILE get_chart_script_footer($charting_type, "bdh-chart.html", "Top Level");
+
+	    close CHART_FILE;
+
+	    print LINK_PAGE "<a href='top-level/bdh-chart.html'>Top Level</a><br/>\n";
+	} else {
+	    print STDERR "postprocess-iostat: Could not create $output_directory/top-level/chart.sh!\n";
+	}
+
+	print LINK_PAGE "<br/><b>Layers</b><br/>\n";
+
+	for (my $i=0; $i<=$max_layer; $i++) {
+	    my $valid_devices = 0;
+	    foreach my $key (keys %{$bdh{'block'}}) {
+		if (($bdh{'block'}{$key}{'layer'} == $i) &&
+		    include_partitions(exists $bdh{'block'}{$key}{'partition'}, exists $devices{$bdh{'block'}{$key}{'short_name'}})){
+		    $valid_devices = 1;
+		    last;
+		}
+	    }
+
+	    # skip the layer if there are no valid devices
+	    if (! $valid_devices) {
+		print LINK_PAGE "Layer $i: No valid devices<br/>\n";
+		next;
+	    }
+
+	    mkdir "$output_directory/layer-$i";
+
+	    if (open(CHART_FILE, ">", "$output_directory/layer-$i/$file_name")) {
+		chmod ($file_mode, "$output_directory/layer-$i/$file_name");
+
+		print CHART_FILE get_chart_script_header($charting_type);
+
+		my %plot_data;
+		my @plot_devices;
+
+		# find the devices for the current layer which are not partitions (partition data not included in the current iostat mode)
+		foreach my $key (sort device_sort keys %{$bdh{'block'}}) {
+		    if (($bdh{'block'}{$key}{'layer'} == $i) &&
+			include_partitions(exists $bdh{'block'}{$key}{'partition'}, exists $devices{$bdh{'block'}{$key}{'short_name'}})){
+
+			# make sure the device exists in the iostat data
+			if (exists $devices{$bdh{'block'}{$key}{'short_name'}}) {
+			    $bdh{'block'}{$key}{'iostat'} = 1;
+			    push @plot_devices, $bdh{'block'}{$key}{'short_name'};
+			} else {
+			    $bdh{'block'}{$key}{'iostat'} = 0;
+			}
+		    }
+		}
+
+		create_devices_plot_data(\%plot_data, \@plot_devices);
+
+		print CHART_FILE get_chart_script_commands_devices($charting_type, "Layer $i", \%plot_data, $output_directory);
+
+		print CHART_FILE get_chart_script_footer($charting_type, "bdh-chart.html", "Layer $i");
+
+		close CHART_FILE;
+
+		print LINK_PAGE "<a href='layer-$i/bdh-chart.html'>Layer $i</a><br/>\n";
+	    } else {
+		print STDERR "postprocess-iostat: Could not create $output_directory/layer-$i/chart.sh!\n";
+	    }
+	}
+
+	print LINK_PAGE "<br/><b>Per Adapter</b><br/>\n";
+
+	foreach my $key (sort keys %{$bdh{'adapters'}}) {
+	    # ignore any adapters that do not have devices
+	    if (! exists $bdh{'adapters'}{$key}{'devices'}) {
+		print LINK_PAGE "$bdh{'adapters'}{$key}{'class'} - $key - $bdh{'adapters'}{$key}{'type'}: No devices<br/>\n";
+		next;
+	    }
+
+	    # check that an adapter has at least one valid device (example of a non-valid is a CD/DVD)
+	    my $valid_devices = 0;
+	    for (my $i=0; $i<@{$bdh{'adapters'}{$key}{'devices'}}; $i++) {
+		if (exists $devices{$bdh{'block'}{$bdh{'adapters'}{$key}{'devices'}[$i]}{'short_name'}}) {
+		    $valid_devices = 1;
+		    last;
+		}
+	    }
+
+	    # skip the adapter if there are no valid devices
+	    if (! $valid_devices) {
+		print LINK_PAGE "$bdh{'adapters'}{$key}{'class'} - $key - $bdh{'adapters'}{$key}{'type'}: No valid devices<br/>\n";
+		next;
+	    }
+
+	    mkdir "$output_directory/$bdh{'adapters'}{$key}{'class'}-$key-$bdh{'adapters'}{$key}{'type'}";
+
+	    if (open(CHART_FILE, ">", "$output_directory/$bdh{'adapters'}{$key}{'class'}-$key-$bdh{'adapters'}{$key}{'type'}/$file_name")) {
+		chmod ($file_mode, "$output_directory/$bdh{'adapters'}{$key}{'class'}-$key-$bdh{'adapters'}{$key}{'type'}/$file_name");
+
+		print CHART_FILE get_chart_script_header($charting_type);
+
+		my %plot_data;
+		my @plot_devices;
+
+		for (my $i=0; $i<@{$bdh{'adapters'}{$key}{'devices'}}; $i++) {
+		    # make sure the device exists in the iostat data
+		    if (exists $devices{$bdh{'block'}{$bdh{'adapters'}{$key}{'devices'}[$i]}{'short_name'}}) {
+			$bdh{'block'}{$bdh{'adapters'}{$key}{'devices'}[$i]}{'iostat'} = 1;
+
+			# tag the device for future use (temporary)
+			$bdh{'block'}{$bdh{'adapters'}{$key}{'devices'}[$i]}{$key} = 1;
+		    } else {
+			$bdh{'block'}{$bdh{'adapters'}{$key}{'devices'}[$i]}{'iostat'} = 0;
+		    }
+		}
+
+		# find the tagged devices and add them to the array
+		foreach my $key2 (sort device_sort keys %{$bdh{'block'}}) {
+		    if (exists $bdh{'block'}{$key2}{$key}) {
+			push @plot_devices, $bdh{'block'}{$key2}{'short_name'};
+			# delete the temporary tag
+			delete $bdh{'block'}{$key2}{$key};
+		    }
+		}
+
+		create_devices_plot_data(\%plot_data, \@plot_devices);
+
+		print CHART_FILE get_chart_script_commands_devices($charting_type, "Per Adapter $bdh{'adapters'}{$key}{'class'}-$key-$bdh{'adapters'}{$key}{'type'}", \%plot_data, $output_directory);
+
+		print CHART_FILE get_chart_script_footer($charting_type, "bdh-chart.html", "Per Adapter $bdh{'adapters'}{$key}{'class'}-$key-$bdh{'adapters'}{$key}{'type'}");
+
+		close CHART_FILE;
+
+		print LINK_PAGE "<a href='$bdh{'adapters'}{$key}{'class'}-$key-$bdh{'adapters'}{$key}{'type'}/bdh-chart.html'>$bdh{'adapters'}{$key}{'class'} - $key - $bdh{'adapters'}{$key}{'type'}</a><br/>\n";
+	    } else {
+		print STDERR "postprocess-iostat: Could not create $output_directory/$bdh{'adapters'}{$key}{'class'}-$key-$bdh{'adapters'}{$key}{'type'}/chart.sh!\n";
+	    }
+	}
+
+	print LINK_PAGE "<br/><b>Multipath Devices</b><br/>\n";
+
+	foreach $key (sort device_sort keys %{$bdh{'block'}}) {
+	    if (exists $bdh{'block'}{$key}{'multipath'} &&
+		exists $bdh{'block'}{$key}{'components'} &&
+		(@{$bdh{'block'}{$key}{'components'}} > 0)) {
+		mkdir "$output_directory/multipath-" . $bdh{'block'}{$key}{'short_name'};
+
+		if (open(CHART_FILE, ">", "$output_directory/multipath-" . $bdh{'block'}{$key}{'short_name'} . "/$file_name")) {
+		    my $page_title;
+
+		    print LINK_PAGE "<a href='multipath-" . $bdh{'block'}{$key}{'short_name'} . "/bdh-chart.html'>";
+		    if (exists ($bdh{'block'}{$key}{'long_name'})) {
+			$page_title = $bdh{'block'}{$key}{'long_name'};
+			print LINK_PAGE $bdh{'block'}{$key}{'long_name'};
+			print LINK_PAGE " (" . $bdh{'block'}{$key}{'short_name'} . ")";
+		    } else {
+			$page_title = $bdh{'block'}{$key}{'short_name'};
+			print LINK_PAGE $bdh{'block'}{$key}{'short_name'};
+		    }
+		    print LINK_PAGE "</a></br>\n";
+
+		    chmod ($file_mode, "$output_directory/multipath-" . $bdh{'block'}{$key}{'short_name'} . "/$file_name");
+
+		    my %multipath_plot_data;
+		    my @multipath_plot_devices = ( $bdh{'block'}{$key}{'short_name'} );
+
+		    create_devices_plot_data(\%multipath_plot_data, \@multipath_plot_devices);
+
+		    my %component_plot_data;
+		    my @component_plot_devices;
+
+		    for (my $i=0; $i<@{$bdh{'block'}{$key}{'components'}}; $i++) {
+			push @component_plot_devices, $bdh{'block'}{$bdh{'block'}{$key}{'components'}[$i]}{'short_name'};
+		    }
+
+		    create_devices_plot_data(\%component_plot_data, \@component_plot_devices);
+
+		    print CHART_FILE get_chart_script_header($charting_type);
+
+		    print CHART_FILE get_chart_script_commands_multilayer($charting_type, "Multipath $page_title", \%multipath_plot_data, \%component_plot_data, $output_directory);
+
+		    print CHART_FILE get_chart_script_footer($charting_type, "bdh-chart.html", "Multipath $page_title");
+
+		    close CHART_FILE;
+		} else {
+		    print STDERR "postprocess-iostat: Could not create $output_directory/multipath-" . $bdh{'block'}{$key}{'short_name'} . "/chart.sh!\n";
+		}
+	    }
+	}
+
+	print LINK_PAGE "<br/><b>Other Multi-component Devices</b><br/>\n";
+
+	foreach $key (sort device_sort keys %{$bdh{'block'}}) {
+	    if (! exists $bdh{'block'}{$key}{'multipath'} &&
+		include_partitions(exists $bdh{'block'}{$key}{'partition'}, exists $devices{$bdh{'block'}{$key}{'short_name'}}) &&
+		exists $bdh{'block'}{$key}{'components'} &&
+		(@{$bdh{'block'}{$key}{'components'}} > 0)) {
+		mkdir "$output_directory/multi-device-" . $bdh{'block'}{$key}{'short_name'};
+
+		if (open(CHART_FILE, ">", "$output_directory/multi-device-" . $bdh{'block'}{$key}{'short_name'} . "/$file_name")) {
+		    my $page_title;
+
+		    print LINK_PAGE "<a href='multi-device-" . $bdh{'block'}{$key}{'short_name'} . "/bdh-chart.html'>";
+		    if (exists ($bdh{'block'}{$key}{'long_name'})) {
+			$page_title = $bdh{'block'}{$key}{'long_name'};
+			print LINK_PAGE $bdh{'block'}{$key}{'long_name'};
+			print LINK_PAGE " (" . $bdh{'block'}{$key}{'short_name'} . ")";
+		    } else {
+			$page_title = $bdh{'block'}{$key}{'short_name'};
+			print LINK_PAGE $bdh{'block'}{$key}{'short_name'};
+		    }
+		    print LINK_PAGE "</a></br>\n";
+
+		    chmod ($file_mode, "$output_directory/multi-device-" . $bdh{'block'}{$key}{'short_name'} . "/$file_name");
+
+		    my %parent_plot_data;
+		    my @parent_plot_devices = ( $bdh{'block'}{$key}{'short_name'} );
+
+		    create_devices_plot_data(\%parent_plot_data, \@parent_plot_devices);
+
+		    my %component_plot_data;
+		    my @component_plot_devices;
+
+		    for (my $i=0; $i<@{$bdh{'block'}{$key}{'components'}}; $i++) {
+			if (exists $bdh{'block'}{$bdh{'block'}{$key}{'components'}[$i]}{'partition'} &&
+			    exists $bdh{'block'}{$bdh{'block'}{$key}{'components'}[$i]}{'components'} &&
+			    (@{$bdh{'block'}{$bdh{'block'}{$key}{'components'}[$i]}{'components'}} == 1)) {
+			    push @component_plot_devices, $bdh{'block'}{$bdh{'block'}{$bdh{'block'}{$key}{'components'}[$i]}{'components'}[0]}{'short_name'};
+			} else {
+			    push @component_plot_devices, $bdh{'block'}{$bdh{'block'}{$key}{'components'}[$i]}{'short_name'};
+			}
+		    }
+
+		    create_devices_plot_data(\%component_plot_data, \@component_plot_devices);
+
+		    print CHART_FILE get_chart_script_header($charting_type);
+
+		    print CHART_FILE get_chart_script_commands_multilayer($charting_type, "Multi-device $page_title", \%parent_plot_data, \%component_plot_data, $output_directory);
+
+		    print CHART_FILE get_chart_script_footer($charting_type, "bdh-chart.html", "Multi-device $page_title");
+
+		    close CHART_FILE;
+		} else {
+		    print STDERR "postprocess-iostat: Could not create $output_directory/multi-device-" . $bdh{'block'}{$key}{'short_name'} . "/chart.sh!\n";
+		}
+	    }
+	}
+
+	if (exists $bdh{'special'}) {
+	    print LINK_PAGE "<br/><b>BTRFS Filesystems</b><br/>\n";
+
+	    foreach $key (sort keys %{$bdh{'special'}}) {
+		if ($bdh{'special'}{$key}{'type'} eq "btrfs") {
+		    mkdir "$output_directory/btrfs." . $key;
+
+		    if (open(CHART_FILE, ">", "$output_directory/btrfs." . $key . "/$file_name")) {
+			my $page_title;
+
+			print LINK_PAGE "<a href='btrfs." . $key . "/$file_name'>";
+			if (exists $bdh{'special'}{$key}{'label'}) {
+			    $page_title = $bdh{'special'}{$key}{'label'} . "(" . $key . ")";
+			} else {
+			    $page_title = $key;
+			}
+			print LINK_PAGE $page_title;
+			print LINK_PAGE "</a></br>\n";
+
+			chmod($file_mode, "$output_directory/btrfs." . $key . "/$file_name");
+
+			my %plot_data;
+			my @plot_devices;
+
+			if (@{$bdh{'special'}{$key}{'components'}}) {
+			    for (my $i=0; $i<@{$bdh{'special'}{$key}{'components'}}; $i++) {
+				if (exists $bdh{'block'}{$bdh{'special'}{$key}{'components'}[$i]}{'partition'} &&
+				    exists $bdh{'block'}{$bdh{'special'}{$key}{'components'}[$i]}{'components'} &&
+				    (@{$bdh{'block'}{$bdh{'special'}{$key}{'components'}[$i]}{'components'}} == 1)) {
+				    push @plot_devices, $bdh{'block'}{$bdh{'block'}{$bdh{'special'}{$key}{'components'}[$i]}{'components'}[0]}{'short_name'};
+				} else {
+				    push @plot_devices, $bdh{'block'}{$bdh{'special'}{$key}{'components'}[$i]}{'short_name'};
+				}
+			    }
+			}
+
+			create_devices_plot_data(\%plot_data, \@plot_devices);
+
+			print CHART_FILE get_chart_script_commands_devices($charting_type, "BTRFS $page_title", \%plot_data, $output_directory);
+
+			print CHART_FILE get_chart_script_footer($charting_type, "bdh-chart.html", "BTRFS $page_title");
+
+			close CHART_FILE;
+		    } else {
+			print STDERR "postprocess-iostat: Could not create $output_directory/btrfs." . $key . "/$file_name!\n";
+		    }
+		}
+	    }
+	}
+
+	print LINK_PAGE "</body>\n</html>\n";
+
+	close LINK_PAGE;
+    } else {
+	# bdh and partition mode...
+    }
+} else {
+    if (! $ENV{'FORCE_CHART_PL'}) {
+	$file_name = "iostat-chart.html";
+	$file_mode = 0644;
+    }
+
+    if (!open(LINK_PAGE, ">", "$output_directory/chart.html")) {
+	print STDERR "ERROR: Failed to open $output_directory/chart.html for writing!\n";
+    }
+
+    print LINK_PAGE "<html>\n<head>\n<title>Iostat Data</title>\n</head>\n<body>\n";
+
+    mkdir "$output_directory/disk";
+    if (!open(CHART_FILE, ">$output_directory/disk/$file_name")) {
+	print STDERR "postprocess-iostat: Could not create $file_name file\n";
+	exit 1;
+    } else {
+	chmod ($file_mode, "$output_directory/disk/$file_name");
+
+	print LINK_PAGE "<a href='disk/iostat-chart.html'>\"Regular\" Disks</a><br/>\n";
+
+	print CHART_FILE get_chart_script_header($charting_type);
+
+	if ($iostat_type eq "disks") {
+	    my %plot_data;
+
+	    $plot_data{'0'} = { 'number' => '01', 'files' => $rrqm_plot_files, 'files_array' => \@rrqm_plot_array };
+	    $plot_data{'1'} = { 'number' => '02', 'files' => $wrqm_plot_files, 'files_array' => \@wrqm_plot_array };
+	    $plot_data{'2'} = { 'number' => '03', 'files' => $riops_plot_files, 'files_array' => \@riops_plot_array };
+	    $plot_data{'3'} = { 'number' => '04', 'files' => $riops_plot_files, 'files_array' => \@riops_plot_array };
+	    $plot_data{'4'} = { 'number' => '05', 'files' => $wiops_plot_files, 'files_array' => \@wiops_plot_array };
+	    $plot_data{'5'} = { 'number' => '06', 'files' => $wiops_plot_files, 'files_array' => \@wiops_plot_array };
+	    $plot_data{'6'} = { 'number' => '07', 'files' => $kb_read_plot_files, 'files_array' => \@kb_read_plot_array };
+	    $plot_data{'7'} = { 'number' => '08', 'files' => $kb_read_plot_files, 'files_array' => \@kb_read_plot_array };
+	    $plot_data{'8'} = { 'number' => '09', 'files' => $kb_write_plot_files, 'files_array' => \@kb_write_plot_array };
+	    $plot_data{'9'} = { 'number' => '10', 'files' => $kb_write_plot_files, 'files_array' => \@kb_write_plot_array };
+	    $plot_data{'10'} = { 'number' => '11', 'files' => $avg_req_plot_files, 'files_array' => \@avg_req_plot_array };
+	    if ($r_w_request) {
+		$plot_data{'11'} = { 'number' => '12', 'files' => $avg_r_req_plot_files, 'files_array' => \@avg_r_req_plot_array };
+		$plot_data{'12'} = { 'number' => '13', 'files' => $avg_w_req_plot_files, 'files_array' => \@avg_w_req_plot_array };
+	    }
+	    $plot_data{'13'} = { 'number' => '14', 'files' => $avg_que_plot_files, 'files_array' => \@avg_que_plot_array };
+	    $plot_data{'14'} = { 'number' => '15', 'files' => $wait_time_plot_files, 'files_array' => \@wait_time_plot_array };
+	    if ($r_w_wait) {
+		$plot_data{'15'} = { 'number' => '16', 'files' => $waitr_time_plot_files, 'files_array' => \@waitr_time_plot_array };
+		$plot_data{'16'} = { 'number' => '17', 'files' => $waitw_time_plot_files, 'files_array' => \@waitw_time_plot_array };
+	    }
+	    $plot_data{'17'} = { 'number' => '18', 'files' => $service_time_plot_files, 'files_array' => \@service_time_plot_array };
+	    $plot_data{'18'} = { 'number' => '19', 'files' => $util_plot_files, 'files_array' => \@util_plot_array };
+
+	    print CHART_FILE get_chart_script_commands_devices($charting_type, "disk", \%plot_data, $output_directory);
+	} elsif ($iostat_type eq "partitions") {
+	    my %plot_data;
+
+	    $plot_data{'0'} = { 'number' => '01', 'files' => $transaction_plot_files, 'files_array' => \@transaction_plot_array };
+	    $plot_data{'1'} = { 'number' => '02', 'files' => $kb_read_plot_files, 'files_array' => \@kb_read_plot_array };
+	    $plot_data{'2'} = { 'number' => '03', 'files' => $kb_write_plot_files, 'files_array' => \@kb_write_plot_array };
+
+	    print CHART_FILE get_chart_script_commands_partitions($charting_type, "partition", \%plot_data, $output_directory);
+	}
+
+	print CHART_FILE get_chart_script_footer($charting_type, "iostat-chart.html", "All Devices");
+
+	close CHART_FILE;
+    }
+
+    if ($dm_device_count > 0) {
+	mkdir "$output_directory/device-mapper";
+	if (!open(CHART_FILE, ">$output_directory/device-mapper/$file_name")) {
+	    print STDERR "postprocess-iostat: Could not create $file_name file\n";
+	    exit 1;
+	} else {
+	    chmod ($file_mode, "$output_directory/device-mapper/$file_name");
+
+	    print LINK_PAGE "<a href='device-mapper/iostat-chart.html'>Device Mapper Devices</a><br/>\n";
+
+	    print CHART_FILE get_chart_script_header($charting_type);
+
+	    my %plot_data;
+
+	    if ($iostat_type eq "disks") {
+		$plot_data{'0'} = { 'number' => '01', 'files' => $dm_rrqm_plot_files, 'files_array' => \@dm_rrqm_plot_array };
+		$plot_data{'1'} = { 'number' => '02', 'files' => $dm_wrqm_plot_files, 'files_array' => \@dm_wrqm_plot_array };
+		$plot_data{'2'} = { 'number' => '03', 'files' => $dm_riops_plot_files, 'files_array' => \@dm_riops_plot_array };
+		$plot_data{'3'} = { 'number' => '04', 'files' => $dm_riops_plot_files, 'files_array' => \@dm_riops_plot_array };
+		$plot_data{'4'} = { 'number' => '05', 'files' => $dm_wiops_plot_files, 'files_array' => \@dm_wiops_plot_array };
+		$plot_data{'5'} = { 'number' => '06', 'files' => $dm_wiops_plot_files, 'files_array' => \@dm_wiops_plot_array };
+		$plot_data{'6'} = { 'number' => '07', 'files' => $dm_kb_read_plot_files, 'files_array' => \@dm_kb_read_plot_array };
+		$plot_data{'7'} = { 'number' => '08', 'files' => $dm_kb_read_plot_files, 'files_array' => \@dm_kb_read_plot_array };
+		$plot_data{'8'} = { 'number' => '09', 'files' => $dm_kb_write_plot_files, 'files_array' => \@dm_kb_write_plot_array };
+		$plot_data{'9'} = { 'number' => '10', 'files' => $dm_kb_write_plot_files, 'files_array' => \@dm_kb_write_plot_array };
+		$plot_data{'10'} = { 'number' => '11', 'files' => $dm_avg_req_plot_files, 'files_array' => \@dm_avg_req_plot_array };
+		if ($r_w_request) {
+		    $plot_data{'11'} = { 'number' => '12', 'files' => $dm_avg_r_req_plot_files, 'files_array' => \@dm_avg_r_req_plot_array };
+		    $plot_data{'12'} = { 'number' => '13', 'files' => $dm_avg_w_req_plot_files, 'files_array' => \@dm_avg_w_req_plot_array };
+		}
+		$plot_data{'13'} = { 'number' => '14', 'files' => $dm_avg_que_plot_files, 'files_array' => \@dm_avg_que_plot_array };
+		$plot_data{'14'} = { 'number' => '15', 'files' => $dm_wait_time_plot_files, 'files_array' => \@dm_wait_time_plot_array };
+		if ($r_w_wait) {
+		    $plot_data{'15'} = { 'number' => '16', 'files' => $dm_waitr_time_plot_files, 'files_array' => \@dm_waitr_time_plot_array };
+		    $plot_data{'16'} = { 'number' => '17', 'files' => $dm_waitw_time_plot_files, 'files_array' => \@dm_waitw_time_plot_array };
+		}
+		$plot_data{'17'} = { 'number' => '18', 'files' => $dm_service_time_plot_files, 'files_array' => \@dm_service_time_plot_array };
+		$plot_data{'18'} = { 'number' => '19', 'files' => $dm_util_plot_files, 'files_array' => \@dm_util_plot_array };
+
+		print CHART_FILE get_chart_script_commands_devices($charting_type, "dm", \%plot_data, $output_directory);
+	    } else {
+		my %plot_data;
+
+		$plot_data{'0'} = { 'number' => '01', 'files' => $dm_transaction_plot_files, 'files_array' => \@dm_transaction_plot_array };
+		$plot_data{'1'} = { 'number' => '02', 'files' => $dm_kb_read_plot_files, 'files_array' => \@dm_kb_read_plot_array };
+		$plot_data{'2'} = { 'number' => '03', 'files' => $dm_kb_write_plot_files, 'files_array' => \@dm_kb_write_plot_array };
+
+		print CHART_FILE get_chart_script_commands_partitions($charting_type, "dm", \%plot_data, $output_directory);
+	    }
+
+	    print CHART_FILE get_chart_script_footer($charting_type, "iostat-chart.html", "All Devices");
+
+	    close CHART_FILE;
+	}
+    }
+}
+
+if (! $ENV{'FORCE_CHART_PL'} && ! $ENV{'FORCE_JSCHART_NO_PACKED_PLOTFILES'}) {
+    # clean up the non-packed plotfiles
+    my $deleted_plotfile_count = unlink glob "$output_directory/plot-files/*.plot";
+    #print "Deleted $deleted_plotfile_count plot files\n";
+    if (! rmdir "$output_directory/plot-files") {
+	print STDERR "ERROR: Failed to delete $output_directory/plot-files!\n";
+    }
+}
+
+exit;
+
+# subroutine to perform a write to a plotfile, will open the
+# filehandle if required and close it if in open/close mode
+sub write_to_file {
+    my $fh_array = shift;
+    my $name_array = shift;
+    my $index = shift;
+    my $op = shift;
+    my $msg = shift;
+
+    # check if the filehandle is already open
+    if (!fileno($$fh_array[$index])) {
+	if (!open($$fh_array[$index], $op, $$name_array[$index])) {
+	    print STDERR "ERROR: Failed to open $$name_array[$index]!\n";
+	    # no reason to proceed if the open failed
+	    return;
+	}
+    }
+
+    print { $$fh_array[$index] } "$msg";
+
+    # if in open/close mode, the filehandle should be closed after
+    # every write, this will cause a open on each subsequent write but
+    # will keep the number of open filehandles low
+    if ($open_close_mode) {
+	close $$fh_array[$index];
+    }
+}
+
+# perform initial setup for a file including writing the header and
+# storing the filename for future use (if required)
+sub init_file {
+    my $fh_array = shift;
+    my $name_array = shift;
+    my $index = shift;
+    my $file = shift;
+    my $msg = shift;
+
+    # store the filename
+    $$name_array[$index] = $file;
+
+    # initialize the file handle
+    if (open($$fh_array[$index], ">", $$name_array[$index])) {
+	print { $$fh_array[$index] } "$msg";
+
+	# if in open/close mode, the filehandle should be closed after
+	# every write, this will cause a open on each subsequent write but
+	# will keep the number of open filehandles low
+	if ($open_close_mode) {
+	    close $$fh_array[$index];
+	}
+    } else {
+	print STDERR "ERROR: Failed to initialize $$name_array[$index]!\n";
+    }
+}
+
+# generate the commands to create "generic" device graphs for the
+# plot-files (devices) specified in the supplied hash
+sub get_chart_script_commands_devices {
+    my $charting_type = shift;
+    my $label = shift;
+    my $plot_data = shift;
+    my $working_directory = shift;
+
+    my $ret_val = "";
+
+    if ($charting_type eq "jschart") {
+	my $chart_page = new autobench::jschart($label);
+	if ($ENV{'FORCE_JSCHART_REMOTE_LIBRARY'}) {
+	    $chart_page->set_library_remote;
+	}
+
+	if (! $ENV{'FORCE_JSCHART_NO_PACKED_PLOTFILES'}) {
+	    $chart_page->enable_packed_plotfiles($working_directory);
+	}
+
+	$chart_page->enable_raw_data_file_links('../../');
+
+	$chart_page->set_files_location("../");
+
+	$chart_page->add_chart('rrqm', 'line', $label . ' Read Request Merges', 'Time (secs.)', 'Read Requests Merged/sec.');
+	$chart_page->add_plots('rrqm', @{$$plot_data{'0'}{'files_array'}});
+	$chart_page->add_raw_data_sources('rrqm', $input_file);
+
+	$chart_page->add_chart('wrqm', 'line', $label . ' Write Request Merges', 'Time (secs.)', 'Write Requests Merged/sec.');
+	$chart_page->add_plots('wrqm', @{$$plot_data{'1'}{'files_array'}});
+	$chart_page->add_raw_data_sources('wrqm', $input_file);
+
+	$chart_page->add_chart('riops', 'line', $label . ' Read IOPs', 'Time (secs.)', 'IO Ops/Second');
+	$chart_page->add_plots('riops', @{$$plot_data{'2'}{'files_array'}});
+	$chart_page->add_raw_data_sources('riops', $input_file);
+
+	$chart_page->add_chart('riops_stacked', 'stacked', $label . ' Cumulative Read IOPs', 'Time (secs.)', 'IO Ops/Second');
+	$chart_page->add_plots('riops_stacked', @{$$plot_data{'3'}{'files_array'}});
+	$chart_page->add_raw_data_sources('riops_stacked', $input_file);
+
+	$chart_page->add_chart('wiops', 'line', $label . ' Write IOPs', 'Time (secs.)', 'IO Ops/Second');
+	$chart_page->add_plots('wiops', @{$$plot_data{'4'}{'files_array'}});
+	$chart_page->add_raw_data_sources('wiops', $input_file);
+
+	$chart_page->add_chart('wiops_stacked', 'stacked', $label . ' Cumulative Write IOPs', 'Time (secs.)', 'IO Ops/Second');
+	$chart_page->add_plots('wiops_stacked', @{$$plot_data{'5'}{'files_array'}});
+	$chart_page->add_raw_data_sources('wiops_stacked', $input_file);
+
+	$chart_page->add_chart('rkb', 'line', $label . ' Read Throughput', 'Time (secs.)', 'Read ' . $throughput_unit . '/sec');
+	$chart_page->add_plots('rkb', @{$$plot_data{'6'}{'files_array'}});
+	$chart_page->add_raw_data_sources('rkb', $input_file);
+
+	$chart_page->add_chart('rkb_stacked', 'stacked', $label . ' Cumulative Read Throughput', 'Time (secs.)', 'Read ' . $throughput_unit . '/sec');
+	$chart_page->add_plots('rkb_stacked', @{$$plot_data{'7'}{'files_array'}});
+	$chart_page->add_raw_data_sources('rkb_stacked', $input_file);
+
+	$chart_page->add_chart('wkb', 'line', $label . ' Write Throughput', 'Time (secs.)', 'Write ' . $throughput_unit . '/sec');
+	$chart_page->add_plots('wkb', @{$$plot_data{'8'}{'files_array'}});
+	$chart_page->add_raw_data_sources('wkb', $input_file);
+
+	$chart_page->add_chart('wkb_stacked', 'stacked', $label . ' Cumulative Write Throughput', 'Time (secs.)', 'Write ' . $throughput_unit . '/sec');
+	$chart_page->add_plots('wkb_stacked', @{$$plot_data{'9'}{'files_array'}});
+	$chart_page->add_raw_data_sources('wkb_stacked', $input_file);
+
+	$chart_page->add_chart('avgrqsize', 'line', $label . ' Request Size Averages', 'Time (secs.)', 'Average Request Size (sectors)');
+	$chart_page->add_plots('avgrqsize', @{$$plot_data{'10'}{'files_array'}});
+	$chart_page->add_raw_data_sources('avgrqsize', $input_file);
+
+	if ($r_w_request) {
+	    $chart_page->add_chart('r_rqsz', 'line', $label . ' Read Request Size Averages', 'Time (secs.)', 'Average Read Request Size (sectors)');
+	    $chart_page->add_plots('r_rqsz', @{$$plot_data{'11'}{'files_array'}});
+	    $chart_page->add_raw_data_sources('r_rqsz', $input_file);
+
+	    $chart_page->add_chart('w_rqsz', 'line', $label . ' Write Request Size Averages', 'Time (secs.)', 'Average Write Request Size (sectors)');
+	    $chart_page->add_plots('w_rqsz', @{$$plot_data{'12'}{'files_array'}});
+	    $chart_page->add_raw_data_sources('w_rqsz', $input_file);
+	}
+
+	$chart_page->add_chart('avgqusz', 'line', $label . ' Queue Size Averages', 'Time (secs.)', 'Average Queue Size');
+	$chart_page->add_plots('avgqusz', @{$$plot_data{'13'}{'files_array'}});
+	$chart_page->add_raw_data_sources('avgqusz', $input_file);
+
+	$chart_page->add_chart('await', 'line', $label . ' Wait Time', 'Time (secs.)', 'Average Wait Time (ms)');
+	$chart_page->add_plots('await', @{$$plot_data{'14'}{'files_array'}});
+	$chart_page->add_raw_data_sources('await', $input_file);
+
+	if ($r_w_wait) {
+	    $chart_page->add_chart('awaitr', 'line', $label . ' Read Wait Time', 'Time (secs.)', 'Average Read Wait Time (ms)');
+	    $chart_page->add_plots('awaitr', @{$$plot_data{'15'}{'files_array'}});
+	    $chart_page->add_raw_data_sources('awaitr', $input_file);
+
+	    $chart_page->add_chart('awaitw', 'line', $label . ' Write Wait Time', 'Time (secs.)', 'Average Write Wait Time (ms)');
+	    $chart_page->add_plots('awaitw', @{$$plot_data{'16'}{'files_array'}});
+	    $chart_page->add_raw_data_sources('awaitw', $input_file);
+	}
+
+	$chart_page->add_chart('svctm', 'line', $label . ' Service Time', 'Time (secs.)', 'Service Time (ms)');
+	$chart_page->add_plots('svctm', @{$$plot_data{'17'}{'files_array'}});
+	$chart_page->add_raw_data_sources('svctm', $input_file);
+
+	$chart_page->add_chart('util', 'line', $label . ' Utilization', 'Time (secs.)', 'Utilization (%)');
+	$chart_page->add_axis_range_bound('util', 'y', 'min', 0);
+	$chart_page->add_axis_range_bound('util', 'y', 'max', 100);
+	$chart_page->add_plots('util', @{$$plot_data{'18'}{'files_array'}});
+	$chart_page->add_raw_data_sources('util', $input_file);
+
+	return $chart_page->dump_page;
+    } else {
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . $$plot_data{'0'}{'number'} . ' ' . $label . ' Read Request Merges" -x "Time (secs.)" -y "Read Requests Merged/sec" ' .  $$plot_data{'0'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . $$plot_data{'1'}{'number'} . ' ' . $label . ' Write Request Merges" -x "Time (secs.)" -y "Write Requests Merged/sec" ' . $$plot_data{'1'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . $$plot_data{'2'}{'number'} . ' ' . $label . ' Read IOPs" -x "Time (secs.)" -y "IO Ops/Second" ' . $$plot_data{'2'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s stackedlines --title "' . $$plot_data{'3'}{'number'} . ' ' . $label . ' Cumulative Read IOPs" -x "Time (secs.)" -y "IO Ops/Second" ' . $$plot_data{'3'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . $$plot_data{'4'}{'number'} . ' ' . $label . ' Write IOPs" -x "Time (secs.)" -y "IO Ops/Second" ' . $$plot_data{'4'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s stackedlines --title "' . $$plot_data{'5'}{'number'} . ' ' . $label . ' Cumulative Write IOPs" -x "Time (secs.)" -y "IO Ops/Second" ' . $$plot_data{'5'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . $$plot_data{'6'}{'number'} . ' ' . $label . ' Read Throughput" -x "Time (secs.)" -y "Read ' . $throughput_unit . '/sec" ' . $$plot_data{'6'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s stackedlines --title "' . $$plot_data{'7'}{'number'} . ' ' . $label . ' Cumulative Read Throughput" -x "Time (secs.)" -y "Read ' . $throughput_unit . '/sec" ' . $$plot_data{'7'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . $$plot_data{'8'}{'number'} . ' ' . $label . ' Write Throughput" -x "Time (secs.)" -y "Write ' . $throughput_unit . '/sec" ' . $$plot_data{'8'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s stackedlines --title "' . $$plot_data{'9'}{'number'} . ' ' . $label . ' Cumulative Write Throughput" -x "Time (secs.)" -y "Write ' . $throughput_unit . '/sec" ' . $$plot_data{'9'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . $$plot_data{'10'}{'number'} . ' ' . $label . ' Request Size Averages" -x "Time (secs.)" -y "Average Request Size (sectors)" ' . $$plot_data{'10'}{'files'} . "\n\n";
+
+	if ($r_w_request) {
+	    $ret_val .= '$SCRIPT --table html -s lines --title "' . $$plot_data{'11'}{'number'} . ' ' . $label . ' Read Request Size Averages" -x "Time (secs.)" -y "Average Read Request Size (sectors)" ' . $$plot_data{'11'}{'files'} . "\n\n";
+	    $ret_val .= '$SCRIPT --table html -s lines --title "' . $$plot_data{'12'}{'number'} . ' ' . $label . ' Write Request Size Averages" -x "Time (secs.)" -y "Average Write Request Size (sectors)" ' . $$plot_data{'12'}{'files'} . "\n\n";
+	}
+
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . $$plot_data{'13'}{'number'} . ' ' . $label . ' Queue Size Averages" -x "Time (secs.)" -y "Average Queue Size" ' . $$plot_data{'13'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . $$plot_data{'14'}{'number'} . ' ' . $label . ' Wait Time" -x "Time (secs.)" -y "Average Wait Time (ms)" ' . $$plot_data{'14'}{'files'} . "\n\n";
+
+	if ($r_w_wait) {
+	    $ret_val .= '$SCRIPT --table html -s lines --title "' . $$plot_data{'15'}{'number'} . ' ' . $label . ' Read Wait Time" -x "Time (secs.)" -y "Average Read Wait Time (ms)" ' . $$plot_data{'15'}{'files'} . "\n\n";
+	    $ret_val .= '$SCRIPT --table html -s lines --title "' . $$plot_data{'16'}{'number'} . ' ' . $label . ' Write Wait Time" -x "Time (secs.)" -y "Average Write Wait Time (ms)" ' . $$plot_data{'16'}{'files'} . "\n\n";
+	}
+
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . $$plot_data{'17'}{'number'} . ' ' . $label . ' Service Time" -x "Time (secs.)" -y "Service Time (ms)" ' . $$plot_data{'17'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . $$plot_data{'18'}{'number'} . ' ' . $label . ' Utilization" -x "Time (secs.)" -y "Utilization (%)" --y-range=0:100 ' . $$plot_data{'18'}{'files'} . "\n\n";
+
+	$ret_val .= "\n";
+
+	return $ret_val;
+    }
+}
+
+# generate the commands to create "multilayer" device graphs for the
+# plot-files (devices) specified in the supplied hashes
+# the graphs are for a "parent" device (which would be in one layer)
+# and it's "children" device(s) (which would be in a lower layer)
+sub get_chart_script_commands_multilayer {
+    my $charting_type = shift;
+    my $label = shift;
+    my $parent_plot_data = shift;
+    my $children_plot_data = shift;
+    my $working_directory = shift;
+
+    my $ret_val = "";
+
+    my $index = 1;
+
+    if ($charting_type eq "jschart") {
+	my $chart_page = new autobench::jschart($label);
+	if ($ENV{'FORCE_JSCHART_REMOTE_LIBRARY'}) {
+	    $chart_page->set_library_remote;
+	}
+
+	if (! $ENV{'FORCE_JSCHART_NO_PACKED_PLOTFILES'}) {
+            $chart_page->enable_packed_plotfiles($working_directory);
+        }
+
+	$chart_page->set_files_location("../");
+
+	$chart_page->enable_raw_data_file_links('../../');
+
+	$chart_page->add_chart('parent_rrqm', 'line', $label . ' Parent Read Request Merges', 'Time (secs.)', 'Read Requests Merged/sec');
+	$chart_page->add_plots('parent_rrqm', @{$$parent_plot_data{'0'}{'files_array'}});
+	$chart_page->add_raw_data_sources('parent_rrqm', $input_file);
+	$chart_page->add_chart('children_rrqm', 'line', $label . ' Children Read Request Merges', 'Time (secs.)', 'Read Requests Merged/sec');
+	$chart_page->add_plots('children_rrqm', @{$$children_plot_data{'0'}{'files_array'}});
+	$chart_page->add_raw_data_sources('children_rrqm', $input_file);
+
+	$chart_page->add_chart('parent_wrqm', 'line', $label . ' Parent Write Request Merges', 'Time (secs.)', 'Write Requests Merged/sec');
+	$chart_page->add_plots('parent_wrqm', @{$$parent_plot_data{'1'}{'files_array'}});
+	$chart_page->add_raw_data_sources('parent_wrqm', $input_file);
+	$chart_page->add_chart('children_wrqm', 'line', $label . ' Children Write Request Merges', 'Time (secs.)', 'Write Requests Merged/sec');
+	$chart_page->add_plots('children_wrqm', @{$$children_plot_data{'1'}{'files_array'}});
+	$chart_page->add_raw_data_sources('children_wrqm', $input_file);
+
+	$chart_page->add_chart('parent_riops', 'line', $label . ' Parent Read IOPs', 'Time (secs.)', 'IO Ops/Second');
+	$chart_page->add_plots('parent_riops', @{$$parent_plot_data{'2'}{'files_array'}});
+	$chart_page->add_raw_data_sources('parent_riops', $input_file);
+	$chart_page->add_chart('children_riops', 'line', $label . ' Children Read IOPs', 'Time (secs.)', 'IO Ops/Second');
+	$chart_page->add_plots('children_riops', @{$$children_plot_data{'2'}{'files_array'}});
+	$chart_page->add_raw_data_sources('children_riops', $input_file);
+
+	$chart_page->add_chart('parent_riops_stacked', 'stacked', $label . ' Parent Cumulative Read IOPs', 'Time (secs.)', 'IO Ops/Second');
+	$chart_page->add_plots('parent_riops_stacked', @{$$parent_plot_data{'3'}{'files_array'}});
+	$chart_page->add_raw_data_sources('parent_riops_stacked', $input_file);
+	$chart_page->add_chart('children_riops_stacked', 'stacked', $label . ' Children Cumulative Read IOPs', 'Time (secs.)', 'IO Ops/Second');
+	$chart_page->add_plots('children_riops_stacked', @{$$children_plot_data{'3'}{'files_array'}});
+	$chart_page->add_raw_data_sources('children_riops_stacked', $input_file);
+
+	$chart_page->add_chart('parent_wiops', 'line', $label . ' Parent Write IOPs', 'Time (secs.)', 'IO Ops/Second');
+	$chart_page->add_plots('parent_wiops', @{$$parent_plot_data{'4'}{'files_array'}});
+	$chart_page->add_raw_data_sources('parent_wiops', $input_file);
+	$chart_page->add_chart('children_wiops', 'line', $label . ' Children Write IOPs', 'Time (secs.)', 'IO Ops/Second');
+	$chart_page->add_plots('children_wiops', @{$$children_plot_data{'4'}{'files_array'}});
+	$chart_page->add_raw_data_sources('children_wiops', $input_file);
+
+	$chart_page->add_chart('parent_wiops_stacked', 'stacked', $label . ' Parent Cumulative Write IOPs', 'Time (secs.)', 'IO Ops/Second');
+	$chart_page->add_plots('parent_wiops_stacked', @{$$parent_plot_data{'5'}{'files_array'}});
+	$chart_page->add_raw_data_sources('parent_wiops_stacked', $input_file);
+	$chart_page->add_chart('children_wiops_stacked', 'stacked', $label . ' Children Cumulative Write IOPs', 'Time (secs.)', 'IO Ops/Second');
+	$chart_page->add_plots('children_wiops_stacked', @{$$children_plot_data{'5'}{'files_array'}});
+	$chart_page->add_raw_data_sources('children_wiops_stacked', $input_file);
+
+	$chart_page->add_chart('parent_rkb', 'line', $label . ' Parent Read Throughput', 'Time (secs.)', 'Read ' . $throughput_unit . '/sec');
+	$chart_page->add_plots('parent_rkb', @{$$parent_plot_data{'6'}{'files_array'}});
+	$chart_page->add_raw_data_sources('parent_rkb', $input_file);
+	$chart_page->add_chart('children_rkb', 'line', $label . ' Children Read Throughput', 'Time (secs.)', 'Read ' . $throughput_unit . '/sec');
+	$chart_page->add_plots('children_rkb', @{$$children_plot_data{'6'}{'files_array'}});
+	$chart_page->add_raw_data_sources('children_rkb', $input_file);
+
+	$chart_page->add_chart('parent_rkb_stacked', 'stacked', $label . ' Parent Cumulative Read Throughput', 'Time (secs.)', 'Read ' . $throughput_unit . '/sec');
+	$chart_page->add_plots('parent_rkb_stacked', @{$$parent_plot_data{'7'}{'files_array'}});
+	$chart_page->add_raw_data_sources('parent_rkb_stacked', $input_file);
+	$chart_page->add_chart('children_rkb_stacked', 'stacked', $label . ' Children Cumulative Read Throughput', 'Time (secs.)', 'Read ' . $throughput_unit . '/sec');
+	$chart_page->add_plots('children_rkb_stacked', @{$$children_plot_data{'7'}{'files_array'}});
+	$chart_page->add_raw_data_sources('children_rkb_stacked', $input_file);
+
+	$chart_page->add_chart('parent_wkb', 'line', $label . ' Parent Write Throughput', 'Time (secs.)', 'Write ' . $throughput_unit . '/sec');
+	$chart_page->add_plots('parent_wkb', @{$$parent_plot_data{'8'}{'files_array'}});
+	$chart_page->add_raw_data_sources('parent_wkb', $input_file);
+	$chart_page->add_chart('children_wkb', 'line', $label . ' Children Write Throughput', 'Time (secs.)', 'Write ' . $throughput_unit . '/sec');
+	$chart_page->add_plots('children_wkb', @{$$children_plot_data{'8'}{'files_array'}});
+	$chart_page->add_raw_data_sources('children_wkb', $input_file);
+
+	$chart_page->add_chart('parent_wkb_stacked', 'stacked', $label . ' Parent Cumulative Write Throughput', 'Time (secs.)', 'Write ' . $throughput_unit . '/sec');
+	$chart_page->add_plots('parent_wkb_stacked', @{$$parent_plot_data{'9'}{'files_array'}});
+	$chart_page->add_raw_data_sources('parent_wkb_stacked', $input_file);
+	$chart_page->add_chart('children_wkb_stacked', 'stacked', $label . ' Children Cumulative Write Throughput', 'Time (secs.)', 'Write ' . $throughput_unit . '/sec');
+	$chart_page->add_plots('children_wkb_stacked', @{$$children_plot_data{'9'}{'files_array'}});
+	$chart_page->add_raw_data_sources('children_wkb_stacked', $input_file);
+
+	$chart_page->add_chart('parent_avgrqsz', 'line', $label . ' Parent Request Size Averages', 'Time (secs.)', 'Average Request Size (sectors)');
+	$chart_page->add_plots('parent_avgrqsz', @{$$parent_plot_data{'10'}{'files_array'}});
+	$chart_page->add_raw_data_sources('parent_avgrqsz', $input_file);
+	$chart_page->add_chart('children_avgrqsz', 'line', $label . ' Children Request Size Averages', 'Time (secs.)', 'Average Request Size (sectors)');
+	$chart_page->add_plots('children_avgrqsz', @{$$children_plot_data{'10'}{'files_array'}});
+	$chart_page->add_raw_data_sources('children_avgrqsz', $input_file);
+
+	if ($r_w_request) {
+	    $chart_page->add_chart('parent_rrqsz', 'line', $label . ' Parent Read Request Size Averages', 'Time (secs.)', 'Average Read Request Size (sectors)');
+	    $chart_page->add_plots('parent_rrqsz', @{$$parent_plot_data{'11'}{'files_array'}});
+	    $chart_page->add_raw_data_sources('parent_rrqsz', $input_file);
+	    $chart_page->add_chart('children_rrqsz', 'line', $label . ' Children Read Request Size Averages', 'Time (secs.)', 'Average Read Request Size (sectors)');
+	    $chart_page->add_plots('children_rrqsz', @{$$children_plot_data{'11'}{'files_array'}});
+	    $chart_page->add_raw_data_sources('children_rrqsz', $input_file);
+
+	    $chart_page->add_chart('parent_wrqsz', 'line', $label . ' Parent Write Request Size Averages', 'Time (secs.)', 'Average Write Request Size (sectors)');
+	    $chart_page->add_plots('parent_wrqsz', @{$$parent_plot_data{'12'}{'files_array'}});
+	    $chart_page->add_raw_data_sources('parent_wrqsz', $input_file);
+	    $chart_page->add_chart('children_wrqsz', 'line', $label . ' Children Write Request Size Averages', 'Time (secs.)', 'Average Write Request Size (sectors)');
+	    $chart_page->add_plots('children_wrqsz', @{$$children_plot_data{'12'}{'files_array'}});
+	    $chart_page->add_raw_data_sources('children_wrqsz', $input_file);
+	}
+
+	$chart_page->add_chart('parent_avgqusz', 'line', $label . ' Parent Queue Size Averages', 'Time (secs.)', 'Average Queue Size');
+	$chart_page->add_plots('parent_avgqusz', @{$$parent_plot_data{'13'}{'files_array'}});
+	$chart_page->add_raw_data_sources('parent_avgqusz', $input_file);
+	$chart_page->add_chart('children_avgqusz', 'line', $label . ' Children Queue Size Averages', 'Time (secs.)', 'Average Queue Size');
+	$chart_page->add_plots('children_avgqusz', @{$$children_plot_data{'13'}{'files_array'}});
+	$chart_page->add_raw_data_sources('children_avgqusz', $input_file);
+
+	$chart_page->add_chart('parent_await', 'line', $label . ' Parent Wait Time', 'Time (secs.)', 'Average Wait Time (ms)');
+	$chart_page->add_plots('parent_await', @{$$parent_plot_data{'14'}{'files_array'}});
+	$chart_page->add_raw_data_sources('parent_await', $input_file);
+	$chart_page->add_chart('children_await', 'line', $label . ' Children Wait Time', 'Time (secs.)', 'Average Wait Time (ms)');
+	$chart_page->add_plots('children_await', @{$$children_plot_data{'14'}{'files_array'}});
+	$chart_page->add_raw_data_sources('children_await', $input_file);
+
+	if ($r_w_wait) {
+	    $chart_page->add_chart('parent_awaitr', 'line', $label . ' Parent Read Wait Time', 'Time (secs.)', 'Average Read Wait Time (ms)');
+	    $chart_page->add_plots('parent_awaitr', @{$$parent_plot_data{'15'}{'files_array'}});
+	    $chart_page->add_raw_data_sources('parent_awaitr', $input_file);
+	    $chart_page->add_chart('children_awaitr', 'line', $label . ' Children Read Wait Time', 'Time (secs.)', 'Average Read Wait Time (ms)');
+	    $chart_page->add_plots('children_awaitr', @{$$children_plot_data{'15'}{'files_array'}});
+	    $chart_page->add_raw_data_sources('children_awaitr', $input_file);
+
+	    $chart_page->add_chart('parent_awaitw', 'line', $label . ' Parent Write Wait Time', 'Time (secs.)', 'Average Write Wait Time (ms)');
+	    $chart_page->add_plots('parent_awaitw', @{$$parent_plot_data{'16'}{'files_array'}});
+	    $chart_page->add_raw_data_sources('parent_awaitw', $input_file);
+	    $chart_page->add_chart('children_awaitw', 'line', $label . ' Children Write Wait Time', 'Time (secs.)', 'Average Write Wait Time (ms)');
+	    $chart_page->add_plots('children_awaitw', @{$$children_plot_data{'16'}{'files_array'}});
+	    $chart_page->add_raw_data_sources('children_awaitw', $input_file);
+	}
+
+	$chart_page->add_chart('parent_svctm', 'line', $label . ' Parent Service Time', 'Time (secs.)', 'Service Time (ms)');
+	$chart_page->add_plots('parent_svctm', @{$$parent_plot_data{'17'}{'files_array'}});
+	$chart_page->add_raw_data_sources('parent_svctm', $input_file);
+	$chart_page->add_chart('children_svctm', 'line', $label . ' Children Service Time', 'Time (secs.)', 'Service Time (ms)');
+	$chart_page->add_plots('children_svctm', @{$$children_plot_data{'17'}{'files_array'}});
+	$chart_page->add_raw_data_sources('children_svctm', $input_file);
+
+	$chart_page->add_chart('parent_util', 'line', $label . ' Parent Utilization', 'Time (secs.)', 'Utilization (%)');
+	$chart_page->add_axis_range_bound('parent_util', 'y', 'min', 0);
+	$chart_page->add_axis_range_bound('parent_util', 'y', 'max', 100);
+	$chart_page->add_plots('parent_util', @{$$parent_plot_data{'18'}{'files_array'}});
+	$chart_page->add_raw_data_sources('parent_util', $input_file);
+	$chart_page->add_chart('children_util', 'line', $label . ' Children Utilization', 'Time (secs.)', 'Utilization (%)');
+	$chart_page->add_axis_range_bound('children_util', 'y', 'min', 0);
+	$chart_page->add_axis_range_bound('children_util', 'y', 'max', 100);
+	$chart_page->add_plots('children_util', @{$$children_plot_data{'18'}{'files_array'}});
+	$chart_page->add_raw_data_sources('children_util', $input_file);
+
+	return $chart_page->dump_page;
+    } else {
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Parent Read Request Merges" -x "Time (secs.)" -y "Read Requests Merged/sec" ' .  $$parent_plot_data{'0'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Children Read Request Merges" -x "Time (secs.)" -y "Read Requests Merged/sec" ' .  $$children_plot_data{'0'}{'files'} . "\n\n";
+
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Parent Write Request Merges" -x "Time (secs.)" -y "Write Requests Merged/sec" ' . $$parent_plot_data{'1'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Children Write Request Merges" -x "Time (secs.)" -y "Write Requests Merged/sec" ' . $$children_plot_data{'1'}{'files'} . "\n\n";
+
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Parent Read IOPs" -x "Time (secs.)" -y "IO Ops/Second" ' . $$parent_plot_data{'2'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Children Read IOPs" -x "Time (secs.)" -y "IO Ops/Second" ' . $$children_plot_data{'2'}{'files'} . "\n\n";
+
+	$ret_val .= '$SCRIPT --table html -s stackedlines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Parent Cumulative Read IOPs" -x "Time (secs.)" -y "IO Ops/Second" ' . $$parent_plot_data{'3'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s stackedlines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Children Cumulative Read IOPs" -x "Time (secs.)" -y "IO Ops/Second" ' . $$children_plot_data{'3'}{'files'} . "\n\n";
+
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Parent Write IOPs" -x "Time (secs.)" -y "IO Ops/Second" ' . $$parent_plot_data{'4'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Children Write IOPs" -x "Time (secs.)" -y "IO Ops/Second" ' . $$children_plot_data{'4'}{'files'} . "\n\n";
+
+	$ret_val .= '$SCRIPT --table html -s stackedlines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Parent Cumulative Write IOPs" -x "Time (secs.)" -y "IO Ops/Second" ' . $$parent_plot_data{'5'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s stackedlines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Children Cumulative Write IOPs" -x "Time (secs.)" -y "IO Ops/Second" ' . $$children_plot_data{'5'}{'files'} . "\n\n";
+
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Parent Read Throughput" -x "Time (secs.)" -y "Read ' . $throughput_unit . '/sec" ' . $$parent_plot_data{'6'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Children Read Throughput" -x "Time (secs.)" -y "Read ' . $throughput_unit . '/sec" ' . $$children_plot_data{'6'}{'files'} . "\n\n";
+
+	$ret_val .= '$SCRIPT --table html -s stackedlines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Parent Cumulative Read Throughput" -x "Time (secs.)" -y "Read ' . $throughput_unit . '/sec" ' . $$parent_plot_data{'7'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s stackedlines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Children Cumulative Read Throughput" -x "Time (secs.)" -y "Read ' . $throughput_unit . '/sec" ' . $$children_plot_data{'7'}{'files'} . "\n\n";
+
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Parent Write Throughput" -x "Time (secs.)" -y "Write ' . $throughput_unit . '/sec" ' . $$parent_plot_data{'8'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Children Write Throughput" -x "Time (secs.)" -y "Write ' . $throughput_unit . '/sec" ' . $$children_plot_data{'8'}{'files'} . "\n\n";
+
+	$ret_val .= '$SCRIPT --table html -s stackedlines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Parent Cumulative Write Throughput" -x "Time (secs.)" -y "Write ' . $throughput_unit . '/sec" ' . $$parent_plot_data{'9'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s stackedlines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Children Cumulative Write Throughput" -x "Time (secs.)" -y "Write ' . $throughput_unit . '/sec" ' . $$children_plot_data{'9'}{'files'} . "\n\n";
+
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Parent Request Size Averages" -x "Time (secs.)" -y "Average Request Size (sectors)" ' . $$parent_plot_data{'10'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Children Request Size Averages" -x "Time (secs.)" -y "Average Request Size (sectors)" ' . $$children_plot_data{'10'}{'files'} . "\n\n";
+
+	if ($r_w_request) {
+	    $ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Parent Read Request Size Averages" -x "Time (secs.)" -y "Average Read Request Size (sectors)" ' . $$parent_plot_data{'11'}{'files'} . "\n\n";
+	    $ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Children Read Request Size Averages" -x "Time (secs.)" -y "Average Read Request Size (sectors)" ' . $$children_plot_data{'11'}{'files'} . "\n\n";
+
+	    $ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Parent Write Request Size Averages" -x "Time (secs.)" -y "Average Write Request Size (sectors)" ' . $$parent_plot_data{'12'}{'files'} . "\n\n";
+	    $ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Children Write Request Size Averages" -x "Time (secs.)" -y "Average Write Request Size (sectors)" ' . $$children_plot_data{'12'}{'files'} . "\n\n";
+	}
+
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Parent Queue Size Averages" -x "Time (secs.)" -y "Average Queue Size" ' . $$parent_plot_data{'13'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Children Queue Size Averages" -x "Time (secs.)" -y "Average Queue Size" ' . $$children_plot_data{'13'}{'files'} . "\n\n";
+
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Parent Wait Time" -x "Time (secs.)" -y "Average Wait Time (ms)" ' . $$parent_plot_data{'14'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Children Wait Time" -x "Time (secs.)" -y "Average Wait Time (ms)" ' . $$children_plot_data{'14'}{'files'} . "\n\n";
+
+	if ($r_w_wait) {
+	    $ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Parent Read Wait Time" -x "Time (secs.)" -y "Average Read Wait Time (ms)" ' . $$parent_plot_data{'15'}{'files'} . "\n\n";
+	    $ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Children Read Wait Time" -x "Time (secs.)" -y "Average Read Wait Time (ms)" ' . $$children_plot_data{'15'}{'files'} . "\n\n";
+
+	    $ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Parent Write Wait Time" -x "Time (secs.)" -y "Average Write Wait Time (ms)" ' . $$parent_plot_data{'16'}{'files'} . "\n\n";
+	    $ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Children Write Wait Time" -x "Time (secs.)" -y "Average Write Wait Time (ms)" ' . $$children_plot_data{'16'}{'files'} . "\n\n";
+	}
+
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Parent Service Time" -x "Time (secs.)" -y "Service Time (ms)" ' . $$parent_plot_data{'17'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Children Service Time" -x "Time (secs.)" -y "Service Time (ms)" ' . $$children_plot_data{'17'}{'files'} . "\n\n";
+
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Parent Utilization" -x "Time (secs.)" -y "Utilization (%)" --y-range=0:100 ' . $$parent_plot_data{'18'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . sprintf("%02d", $index++) . ' ' . $label . ' Children Utilization" -x "Time (secs.)" -y "Utilization (%)" --y-range=0:100 ' . $$children_plot_data{'18'}{'files'} . "\n\n";
+
+	$ret_val .= "\n";
+
+	return $ret_val;
+    }
+}
+
+# generate the commands to create partition graphs for the
+# plot-files (devices) specified in the supplied hash
+sub get_chart_script_commands_partitions {
+    my $charting_type = shift;
+    my $label = shift;
+    my $plot_data = shift;
+    my $working_directory = shift;
+
+    my $ret_val = "";
+
+    if ($charting_type eq "jschart") {
+	my $chart_page = new autobench::jschart($label);
+	if ($ENV{'FORCE_JSCHART_REMOTE_LIBRARY'}) {
+	    $chart_page->set_library_remote;
+	}
+
+	if (! $ENV{'FORCE_JSCHART_NO_PACKED_PLOTFILES'}) {
+            $chart_page->enable_packed_plotfiles($working_directory);
+        }
+
+	$chart_page->set_files_location("../");
+
+	$chart_page->enable_raw_data_file_links('../../');
+
+	$chart_page->add_chart('transactions', 'line', $label . ' transactions', 'Time (secs.)', 'Transaction/sec');
+	$chart_page->add_plots('transactions', @{$$plot_data{'0'}{'files_array'}});
+	$chart_page->add_raw_data_sources('transactions', $input_file);
+
+	$chart_page->add_chart('rkb', 'line', $label . ' read throughput', 'Time (secs.)', 'Read KBytes/sec');
+	$chart_page->add_plots('rkb', @{$$plot_data{'1'}{'files_array'}});
+	$chart_page->add_raw_data_sources('rkb', $input_file);
+
+	$chart_page->add_chart('wkb', 'line', $label . ' write throughput', 'Time (secs.)', 'Write KBytes/sec');
+	$chart_page->add_plots('wkb', @{$$plot_data{'2'}{'files_array'}});
+	$chart_page->add_raw_data_sources('wkb', $input_file);
+
+	return $chart_page->dump_page;
+    } else {
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . $$plot_data{'0'}{'number'} . ' ' . $label . ' transactions" -x "Time (secs.)" -y "Transaction/sec" ' . $$plot_data{'0'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . $$plot_data{'1'}{'number'} . ' ' . $label . ' read throughput" -x "Time (secs.)" -y "Read KBytes/sec" ' . $$plot_data{'1'}{'files'} . "\n\n";
+	$ret_val .= '$SCRIPT --table html -s lines --title "' . $$plot_data{'2'}{'number'} . ' ' . $label . ' write throughput" -x "Time (secs.)" -y "Write KBytes/sec" ' . $$plot_data{'2'}{'files'} . "\n\n";
+
+	$ret_val .= "\n";
+
+	return $ret_val;
+    }
+}
+
+# generate the chart script header
+sub get_chart_script_header {
+    my $charting_type = shift;
+
+    if ($charting_type eq "jschart") {
+	return "";
+    }
+
+    my $ret_val = "";
+
+    $ret_val .= "#!/bin/bash\n\n";
+    $ret_val .= 'DIR=`dirname $0`' . "\n\n";
+    $ret_val .= 'if [ $# != 2 ]; then' . "\n";
+    $ret_val .= '  echo "You must specify the path to the chart.pl script and the Chart Directory libraries."' . "\n";
+    $ret_val .= '  exit 1' . "\n";
+    $ret_val .= 'fi' . "\n\n";
+    $ret_val .= 'SCRIPT=$1' . "\n";
+    $ret_val .= 'LIBRARIES=$2' . "\n\n";
+    $ret_val .= 'export PERL5LIB=$LIBRARIES' . "\n\n";
+    $ret_val .= 'pushd $DIR > /dev/null' . "\n\n\n";
+
+    return $ret_val;
+}
+
+# generate the chart script footer
+sub get_chart_script_footer {
+    my $charting_type = shift;
+    my $out_file = shift;
+    my $title = shift;
+
+    if ($charting_type eq "jschart") {
+	return "";
+    }
+
+    my $ret_val = "";
+
+    $ret_val .= 'echo -e "<html>\n<head>\n<title>IOstat Charts for ' . $title . '</title>\n</head>\n<body>\n" > ' . "$out_file\n";
+    $ret_val .= 'for i in `ls -1 *.png`; do' . "\n";
+    $ret_val .= '  echo -e "<table>\n<tr valign=\'top\'>\n" >> ' . "$out_file\n";
+    $ret_val .= '  echo -e "<td><img src=\'$i\'></td>\n" >> ' . "$out_file\n";
+    $ret_val .= '  html_file=`echo $i | sed -e "s/png/html/"`' . "\n";
+    $ret_val .= '  if [ -e $html_file ]; then' . "\n";
+    $ret_val .= '    echo -e "<td>\n" >> ' . "$out_file\n";
+    $ret_val .= '    cat $html_file >> ' . "$out_file\n";
+    $ret_val .= '    echo -e "</td>\n" >> ' . "$out_file\n";
+    $ret_val .= '  fi' . "\n";
+    $ret_val .= '  echo -e "</tr>\n</table>\n" >> ' . "$out_file\n";
+    $ret_val .= 'done' . "\n";
+    $ret_val .= 'echo -e "</body>\n</html>\n" >> ' . "$out_file\n";
+
+    return $ret_val;
+}
+
+# given an array of devices create the plot data required to generate plot commands
+sub create_devices_plot_data {
+    my $plot_data = shift;
+    my $plot_devices = shift;
+
+    my $counter = 1;
+    $$plot_data{'0'} = { 'number' => sprintf("%02d", $counter++), 'files' => "", 'files_array' => () };
+    $$plot_data{'1'} = { 'number' => sprintf("%02d", $counter++), 'files' => "", 'files_array' => () };
+    $$plot_data{'2'} = { 'number' => sprintf("%02d", $counter++), 'files' => "", 'files_array' => () };
+    $$plot_data{'3'} = { 'number' => sprintf("%02d", $counter++), 'files' => "", 'files_array' => () };
+    $$plot_data{'4'} = { 'number' => sprintf("%02d", $counter++), 'files' => "", 'files_array' => () };
+    $$plot_data{'5'} = { 'number' => sprintf("%02d", $counter++), 'files' => "", 'files_array' => () };
+    $$plot_data{'6'} = { 'number' => sprintf("%02d", $counter++), 'files' => "", 'files_array' => () };
+    $$plot_data{'7'} = { 'number' => sprintf("%02d", $counter++), 'files' => "", 'files_array' => () };
+    $$plot_data{'8'} = { 'number' => sprintf("%02d", $counter++), 'files' => "", 'files_array' => () };
+    $$plot_data{'9'} = { 'number' => sprintf("%02d", $counter++), 'files' => "", 'files_array' => () };
+    $$plot_data{'10'} = { 'number' => sprintf("%02d", $counter++), 'files' => "", 'files_array' => () };
+    if ($r_w_request) {
+	$$plot_data{'11'} = { 'number' => sprintf("%02d", $counter++), 'files' => "", 'files_array' => () };
+	$$plot_data{'12'} = { 'number' => sprintf("%02d", $counter++), 'files' => "", 'files_array' => () };
+    }
+    $$plot_data{'13'} = { 'number' => sprintf("%02d", $counter++), 'files' => "", 'files_array' => () };
+    $$plot_data{'14'} = { 'number' => sprintf("%02d", $counter++), 'files' => "", 'files_array' => () };
+    if ($r_w_wait) {
+	$$plot_data{'15'} = { 'number' => sprintf("%02d", $counter++), 'files' => "", 'files_array' => () };
+	$$plot_data{'16'} = { 'number' => sprintf("%02d", $counter++), 'files' => "", 'files_array' => () };
+    }
+    $$plot_data{'17'} = { 'number' => sprintf("%02d", $counter++), 'files' => "", 'files_array' => () };
+    $$plot_data{'18'} = { 'number' => sprintf("%02d", $counter++), 'files' => "", 'files_array' => () };
+
+    for (my $i=0; $i<@{$plot_devices}; $i++) {
+	$$plot_data{'0'}{'files'} .= "../plot-files/" . $$plot_devices[$i] . ".rrqm.plot ";
+	push @{$$plot_data{'0'}{'files_array'}}, $$plot_devices[$i] . '.rrqm';
+
+	$$plot_data{'1'}{'files'} .= "../plot-files/" . $$plot_devices[$i] . ".wrqm.plot ";
+	push @{$$plot_data{'1'}{'files_array'}}, $$plot_devices[$i] . '.wrqm';
+
+	$$plot_data{'2'}{'files'} .= "../plot-files/" . $$plot_devices[$i] . ".riops.plot ";
+	push @{$$plot_data{'2'}{'files_array'}}, $$plot_devices[$i] . '.riops';
+
+	# 3 is a copy of 2
+
+	$$plot_data{'4'}{'files'} .= "../plot-files/" . $$plot_devices[$i] . ".wiops.plot ";
+	push @{$$plot_data{'4'}{'files_array'}}, $$plot_devices[$i] . '.wiops';
+
+	# 5 is a copy of 4
+
+	$$plot_data{'6'}{'files'} .= "../plot-files/" . $$plot_devices[$i] . ".rkb.plot ";
+	push @{$$plot_data{'6'}{'files_array'}}, $$plot_devices[$i] . '.rkb';
+
+	# 7 is a copy of 6
+
+	$$plot_data{'8'}{'files'} .= "../plot-files/" . $$plot_devices[$i] . ".wkb.plot ";
+	push @{$$plot_data{'8'}{'files_array'}}, $$plot_devices[$i] . '.wkb';
+
+	# 9 is a copy of 8
+
+	$$plot_data{'10'}{'files'} .= "../plot-files/" . $$plot_devices[$i] . ".avgrq-sz.plot ";
+	push @{$$plot_data{'10'}{'files_array'}}, $$plot_devices[$i] . '.avgrq-sz';
+
+	if ($r_w_request) {
+	    $$plot_data{'11'}{'files'} .= "../plot-files/" . $$plot_devices[$i] . ".r_rqsz.plot ";
+	    push @{$$plot_data{'11'}{'files_array'}}, $$plot_devices[$i] . '.r_rqsz';
+
+	    $$plot_data{'12'}{'files'} .= "../plot-files/" . $$plot_devices[$i] . ".w_rqsz.plot ";
+	    push @{$$plot_data{'12'}{'files_array'}}, $$plot_devices[$i] . '.w_rqsz';
+	}
+
+	$$plot_data{'13'}{'files'} .= "../plot-files/" . $$plot_devices[$i] . ".avgqu-sz.plot ";
+	push @{$$plot_data{'13'}{'files_array'}}, $$plot_devices[$i] . '.avgqu-sz';
+
+	$$plot_data{'14'}{'files'} .= "../plot-files/" . $$plot_devices[$i] . ".await.plot ";
+	push @{$$plot_data{'14'}{'files_array'}}, $$plot_devices[$i] . '.await';
+
+	if ($r_w_wait) {
+	    $$plot_data{'15'}{'files'} .= "../plot-files/" . $$plot_devices[$i] . ".awaitr.plot ";
+	    push @{$$plot_data{'15'}{'files_array'}}, $$plot_devices[$i] . '.awaitr';
+
+	    $$plot_data{'16'}{'files'} .= "../plot-files/" . $$plot_devices[$i] . ".awaitw.plot ";
+	    push @{$$plot_data{'16'}{'files_array'}}, $$plot_devices[$i] . '.awaitw';
+	}
+
+	$$plot_data{'17'}{'files'} .= "../plot-files/" . $$plot_devices[$i] . ".svctm.plot ";
+	push @{$$plot_data{'17'}{'files_array'}}, $$plot_devices[$i] . '.svctm';
+
+	$$plot_data{'18'}{'files'} .= "../plot-files/" . $$plot_devices[$i] . ".util.plot ";
+	push @{$$plot_data{'18'}{'files_array'}}, $$plot_devices[$i] . '.util';
+    }
+
+    # the following graphs use the exact same list of plot files as
+    # other graphs, so just copy them over
+    $$plot_data{'3'}{'files'} = $$plot_data{'2'}{'files'};
+    push @{$$plot_data{'3'}{'files_array'}}, @{$$plot_data{'2'}{'files_array'}};
+
+    $$plot_data{'5'}{'files'} = $$plot_data{'4'}{'files'};
+    push @{$$plot_data{'5'}{'files_array'}}, @{$$plot_data{'4'}{'files_array'}};
+
+    $$plot_data{'7'}{'files'} = $$plot_data{'6'}{'files'};
+    push @{$$plot_data{'7'}{'files_array'}}, @{$$plot_data{'6'}{'files_array'}};
+
+    $$plot_data{'9'}{'files'} = $$plot_data{'8'}{'files'};
+    push @{$$plot_data{'9'}{'files_array'}}, @{$$plot_data{'8'}{'files_array'}};
+}
+
+# custom sort subroutine for "intelligent" block device ordering
+# prefer to use the long_name for sorting, but fall back to the
+# short_name if no long_name exists
+sub device_sort {
+    if ((exists $bdh{'block'}{$a}{'long_name'}) &&
+	(exists $bdh{'block'}{$b}{'long_name'})) {
+	$bdh{'block'}{$a}{'long_name'} cmp $bdh{'block'}{$b}{'long_name'};
+    } elsif ((exists $bdh{'block'}{$a}{'long_name'}) &&
+	     (! exists $bdh{'block'}{$b}{'long_name'})) {
+	$bdh{'block'}{$a}{'long_name'} cmp $bdh{'block'}{$b}{'short_name'};
+    } elsif ((! exists $bdh{'block'}{$a}{'long_name'}) &&
+	     (exists $bdh{'block'}{$b}{'long_name'})) {
+	$bdh{'block'}{$a}{'short_name'} cmp $bdh{'block'}{$b}{'long_name'};
+    } else {
+	$bdh{'block'}{$a}{'short_name'} cmp $bdh{'block'}{$b}{'short_name'};
+    }
+}
+
+# determine if BDH based processing should include partition data
+sub include_partitions {
+    my $is_partition = shift;
+    my $partition_present = shift;
+
+    if ($is_partition) {
+	if ($partition_present) {
+	    # it is a partition and the data is available
+	    return 1;
+	} else {
+	    # it is a partition and the data is not available
+	    return 0;
+	}
+    } else {
+	# it is not a partition, bypass the test
+	return 1;
+    }
+}
