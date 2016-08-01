@@ -222,6 +222,9 @@ def get_network_interfaces():
         if fields[0].endswith(':'):
             interface = fields[0].rstrip(':')
             interface_list.append(interface)
+        elif ':' in fields[0]:
+            fields = fields[0].split(':')
+            interface_list.append(fields[0])
     return interface_list
 
 ##########################################################################################
