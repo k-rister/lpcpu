@@ -279,10 +279,10 @@ sub get_page_header() {
 
     if ($self->{LIBRARY_LOCATION} eq "local") {
 	$string .= "<script src=\"" . $self->{FILES_LOCATION} . "../jschart.pm/d3.min.js\" charset=\"utf-8\"></script>\n";
-	$string .= "<script src=\"" . $self->{FILES_LOCATION} . "../jschart.pm/queue.min.js\" charset=\"utf-8\"></script>\n";
+	$string .= "<script src=\"" . $self->{FILES_LOCATION} . "../jschart.pm/d3-queue.min.js\" charset=\"utf-8\"></script>\n";
     } elsif ($self->{LIBRARY_LOCATION} eq "remote") {
 	$string .= "<script src=\"http://d3js.org/d3.v3.min.js\" charset=\"utf-8\"></script>\n";
-	$string .= "<script src=\"http://d3js.org/queue.v1.min.js\" charset=\"utf-8\"></script>\n";
+	$string .= "<script src=\"http://d3js.org/d3-queue.v2.min.js\" charset=\"utf-8\"></script>\n";
     }
 
     $string .= "<script src=\"" . $self->{FILES_LOCATION} . "../jschart.pm/jschart.js\" charset=\"utf-8\"></script>\n";
@@ -391,11 +391,12 @@ sub get_chart_html($) {
 	$string .= "<a onclick='navigate_to_chart(\"chart_nav_" . $self->{OBJECTS}->{$id}->{'next_chart'} . "\");'>Next Chart</a>\n";
     }
 
-    $string .= "<br/>\n<table>\n  <tr valign='top'>\n    <td id='" . $chart_label . "_chart'>\n      <script>\n";
+    $string .= "<div id='" . $chart_label . "'>\n  <script>\n";
 
-    $string .= "        create_graph(";
+    $string .= "    create_graph(";
 
     $string .= $self->{OBJECTS}->{$id}->{'type'} . ', ';
+    $string .= '"xy", ';
     $string .= '"' . $chart_label . '", ';
     $string .= '"' . $index . '. ' .$self->{OBJECTS}->{$id}->{'title'} . '", ';
     $string .= '"' . $self->{OBJECTS}->{$id}->{'x_label'} . '", ';
@@ -449,16 +450,10 @@ sub get_chart_html($) {
 	$string .= ' ]';
     }
 
-    $string .= ' }';
+    $string .= ', sort_datasets: false }';
     $string .= ");\n";
 
-    $string .= "      </script>\n    </td>\n    <td>\n      <table class='chart' id='" . $chart_label . "_table'>\n";
-
-    $string .= "        <tr class='header'><th colspan='4'>" . $index . ". " . $self->{OBJECTS}->{$id}->{'title'} . "</th></tr>\n";
-
-    $string .= "        <tr class='header'><th align='left'>Data Sets</th><th align='right'>Data Set Average</th><th align='right'>Data Set Median</th><th>Samples</th></tr>\n";
-
-    $string .= "      </table>\n    </td>\n   </tr>\n</table>\n";
+    $string .= "  </script>\n</div>\n";
 
     return $string;
 }

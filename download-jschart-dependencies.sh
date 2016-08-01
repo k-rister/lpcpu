@@ -14,10 +14,10 @@
 DIR=`dirname $0`
 
 URLS[0]="http://d3js.org/d3.v3.min.js"
-URLS[1]="http://d3js.org/queue.v1.min.js"
+URLS[1]="http://d3js.org/d3-queue.v3.min.js"
 
 FILES[0]="d3.min.js"
-FILES[1]="queue.min.js"
+FILES[1]="d3-queue.min.js"
 
 if pushd ${DIR}/tools/jschart.pm > /dev/null; then
     if which wget > /dev/null 2>&1; then

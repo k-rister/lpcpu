@@ -146,7 +146,7 @@ def sar_executor(name, sar_process, interfaces_list, history_length):
 
                 is_header = 1
                 sample = dict()
-                sample['time'] = time.time()
+                sample['time'] = int(time.time() * 1000)
                 mode = "cpu"
             elif re.search('pgpgin.*pgpgout', sar_output, re.L):
                 is_header = 1
