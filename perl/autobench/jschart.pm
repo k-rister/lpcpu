@@ -282,7 +282,7 @@ sub get_page_header() {
 	$string .= "<script src=\"" . $self->{FILES_LOCATION} . "../jschart.pm/d3-queue.min.js\" charset=\"utf-8\"></script>\n";
     } elsif ($self->{LIBRARY_LOCATION} eq "remote") {
 	$string .= "<script src=\"http://d3js.org/d3.v3.min.js\" charset=\"utf-8\"></script>\n";
-	$string .= "<script src=\"http://d3js.org/d3-queue.v2.min.js\" charset=\"utf-8\"></script>\n";
+	$string .= "<script src=\"http://d3js.org/d3-queue.v3.min.js\" charset=\"utf-8\"></script>\n";
     }
 
     $string .= "<script src=\"" . $self->{FILES_LOCATION} . "../jschart.pm/jschart.js\" charset=\"utf-8\"></script>\n";
