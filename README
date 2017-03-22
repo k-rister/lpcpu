@@ -262,6 +262,10 @@ When the processing phase is complete, the directory will contain a summary.html
 file that can be loaded into a browser to assist in navigating the profiled
 data.
 
+A jschart demo is available at the following URL:
+
+https://k-rister.github.io/pbench/jschart/demo/demo.html
+
 Due to security considerations, some browsers will not allow the jschart code to
 load the chart data files when run "locally" (i.e., without a web server
 delivering the files to the browser).  In the environments that this has been
